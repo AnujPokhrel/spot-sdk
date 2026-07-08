@@ -49,3 +49,5 @@ form button { margin-top: 0.4rem; padding: 0.4rem 0.8rem; background: #2c5282; c
 .estop-allow:disabled { background: #4a5568 !important; cursor: default; }
 #estop-status { font-family: ui-monospace, monospace; font-size: 12px; padding: 0.4rem; border-radius: 3px; background: #1a1d23; }
 #estop-badge { font-family: ui-monospace, monospace; font-size: 12px; }
+#camera-source { width: 100%; margin-top: 0.3rem; }
+#camera-view { width: 100%; margin-top: 0.6rem; background: #000; border-radius: 4px; display: block; aspect-ratio: 4 / 3; object-fit: contain; }

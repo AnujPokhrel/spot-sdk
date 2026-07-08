@@ -43,6 +43,7 @@
         <button class="tab" data-tab="rooms">Rooms</button>
         <button class="tab" data-tab="nogo">No-go</button>
         <button class="tab" data-tab="drive" id="tab-drive" hidden>Drive</button>
+        <button class="tab" data-tab="cameras" id="tab-cameras" hidden>Cameras</button>
       </nav>
       <section id="panel-waypoint" class="panel active">
         <h2>Waypoint</h2>
@@ -74,6 +75,7 @@
         <div id="drive-status" class="muted">Live mode is off.</div>
         <div class="row">
           <button id="drive-power-on">Power on</button>
+          <button id="drive-stand" style="background: #2b6cb0;">Stand</button>
           <button id="drive-upload">Upload graph to robot</button>
           <button id="drive-localize">Localize (nearest fiducial)</button>
         </div>
@@ -89,6 +91,17 @@
         <button id="estop-cut" class="estop-hard" style="margin-top:0.4rem; width:100%;">Hard cut</button>
         <button id="estop-allow" class="estop-allow" style="margin-top:0.4rem; width:100%;" disabled>Allow / re-arm</button>
         <a id="estop-popout" href="#" style="display:inline-block; margin-top:0.6rem; font-size:12px; color:#63b3ed;">↗ Pop out e-stop</a>
+      </section>
+      <section id="panel-cameras" class="panel">
+        <h2>Cameras</h2>
+        <div id="camera-empty" class="muted">Live mode required.</div>
+        <div id="camera-controls" hidden>
+          <label>Source
+            <select id="camera-source"></select>
+          </label>
+          <img id="camera-view" alt="camera stream" />
+          <div id="camera-status" class="muted" style="margin-top:0.4rem;"></div>
+        </div>
       </section>
     </aside>
   </main>

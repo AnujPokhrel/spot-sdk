@@ -1,0 +1,68 @@
+files/
+prebuilt/
+**/edge_snapshots/
+**/waypoint_snapshots/
+graph
+**/__pycache__/
+
+.venv/
+.env
+*.pyc
+.pytest_cache/
+*.egg-info/
+build_cruft/
+prebuilt/*.whl
+
+# Local runtime data — graphs are large binary protos, configs are per-machine.
+graphnav_viz.yaml
+doors.yaml
+
+**/.git/
+.gitignore
+recorded_graphs/
+
+# common examples
+# Dependencies
+node_modules/
+venv/
+.venv/
+env/
+__pycache__/
+*.egg-info/
+
+# Build outputs
+dist/
+build/
+*.o
+*.so
+*.dylib
+.class
+*.jar
+
+# Binary files
+*.bin
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+
+# Large data files
+*.mp4
+*.mov
+*.avi
+*.zip
+*.tar.gz
+*.iso
+
+# IDE and OS files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+

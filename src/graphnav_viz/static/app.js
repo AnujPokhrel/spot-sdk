@@ -38,6 +38,7 @@ async function init() {
     if (state.live.available) {
       document.getElementById('live-toggle').hidden = false;
       document.getElementById('tab-drive').hidden = false;
+      document.getElementById('tab-cameras').hidden = false;
       // Independent of the Live toggle, keep the estop state fresh so the
       // operator always knows if the robot is armed/cut.
       setInterval(async () => {
@@ -116,6 +117,11 @@ document.querySelectorAll('#tabs .tab').forEach(tab => {
     document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
     tab.classList.add('active');
     document.getElementById(`panel-${tab.dataset.tab}`).classList.add('active');
+    if (tab.dataset.tab === 'cameras') {
+      loadCameraSources();
+    } else {
+      stopCameraStream();
+    }
   });
 });
 
@@ -512,11 +518,19 @@ document.getElementById('live-toggle').addEventListener('click', () => {
     document.getElementById('live-badge').hidden = true;
     state.map2d?.draw();
     state.map3d?.setLivePose?.(null);
+    stopCameraStream();
   }
 });
 
 document.getElementById('drive-mode').addEventListener('change', e => {
   state.live.mode = e.target.checked ? 'drive' : 'select';
+  // Click-to-navigate requires Live polling to be on (it's what gates the
+  // nav request and drives pose/estop status) — checking this box is
+  // useless on its own if the user forgot to flip the header toggle, so
+  // turn it on for them instead of silently no-op'ing on waypoint clicks.
+  if (e.target.checked && !state.live.enabled) {
+    document.getElementById('live-toggle').click();
+  }
   setStatus(state.live.mode === 'drive'
     ? 'Drive mode: click a waypoint to send Spot there.'
     : 'Select mode.');
@@ -527,6 +541,17 @@ document.getElementById('drive-power-on').addEventListener('click', async () => 
   const r = await fetch('/api/power_on', { method: 'POST' });
   const j = await r.json().catch(() => ({}));
   setStatus(r.ok ? `Powered on: ${j.powered_on}` : `Power-on failed: ${j.detail || r.status}`);
+});
+
+document.getElementById('drive-stand').addEventListener('click', async () => {
+  setStatus('Standing…');
+  try {
+    const r = await fetch('/api/stand', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    setStatus(r.ok ? 'Standing' : `Stand failed: ${j.detail || r.status}`);
+  } catch (e) {
+    setStatus('Network error while trying to stand.');
+  }
 });
 
 document.getElementById('drive-upload').addEventListener('click', async () => {
@@ -604,6 +629,60 @@ document.getElementById('estop-popout').addEventListener('click', e => {
   e.preventDefault();
   window.open('/estop.html', 'graphnav_viz_estop',
     'width=340,height=320,popup=yes');
+});
+
+// --- Cameras ---
+// The <img> pulls an MJPEG multipart stream directly from the backend; there's
+// no client-side polling loop. Setting img.src to '' closes the underlying
+// connection, which is what stops the server generator (see server.py).
+let cameraSourcesLoaded = false;
+
+async function loadCameraSources() {
+  const empty = document.getElementById('camera-empty');
+  const controls = document.getElementById('camera-controls');
+  if (!state.live.available) {
+    empty.hidden = false;
+    controls.hidden = true;
+    return;
+  }
+  empty.hidden = true;
+  controls.hidden = false;
+  if (cameraSourcesLoaded) {
+    startCameraStream(document.getElementById('camera-source').value);
+    return;
+  }
+  document.getElementById('camera-status').textContent = 'Loading camera list…';
+  try {
+    const sources = await fetch('/api/cameras').then(r => r.json());
+    const visual = sources.filter(s => s.image_type === 'visual');
+    const sel = document.getElementById('camera-source');
+    sel.innerHTML = '';
+    (visual.length ? visual : sources).forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.name;
+      opt.textContent = s.name;
+      sel.appendChild(opt);
+    });
+    cameraSourcesLoaded = true;
+    document.getElementById('camera-status').textContent = '';
+    if (sel.options.length) startCameraStream(sel.value);
+  } catch (e) {
+    document.getElementById('camera-status').textContent = `Failed to list cameras: ${e}`;
+  }
+}
+
+function startCameraStream(source) {
+  if (!source) return;
+  document.getElementById('camera-view').src =
+    `/api/camera_stream/${encodeURIComponent(source)}?t=${Date.now()}`;
+}
+
+function stopCameraStream() {
+  document.getElementById('camera-view').src = '';
+}
+
+document.getElementById('camera-source').addEventListener('change', e => {
+  startCameraStream(e.target.value);
 });
 
 init().catch(err => {

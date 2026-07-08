@@ -7,11 +7,13 @@ import dataclasses
 import logging
 import math
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
 
@@ -32,6 +34,7 @@ class RobotSession:
         # somehow broken / not on PYTHONPATH.
         from bosdyn.client.estop import EstopClient, EstopEndpoint, EstopKeepAlive
         from bosdyn.client.graph_nav import GraphNavClient
+        from bosdyn.client.image import ImageClient
         from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
         from bosdyn.client.robot_command import RobotCommandClient
         from bosdyn.client.robot_state import RobotStateClient
@@ -43,6 +46,7 @@ class RobotSession:
         self.lease_client = self.robot.ensure_client(LeaseClient.default_service_name)
         self.command_client = self.robot.ensure_client(RobotCommandClient.default_service_name)
         self.state_client = self.robot.ensure_client(RobotStateClient.default_service_name)
+        self.image_client = self.robot.ensure_client(ImageClient.default_service_name)
         # Register a software estop endpoint BEFORE taking the lease. Without
         # an active endpoint the robot reports as estopped and refuses motion.
         # force_simple_setup() displaces any existing endpoint (e.g. the
@@ -378,6 +382,85 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
                 LOG.exception('power_on failed')
                 raise HTTPException(502, f'power_on failed: {type(e).__name__}: {e}') from e
         return {'ok': True, 'powered_on': s.robot.is_powered_on()}
+
+    @app.post('/api/stand')
+    def post_stand():
+        s = _require_session()
+        from bosdyn.client.robot_command import blocking_stand
+        with s._lock:
+            try:
+                blocking_stand(s.command_client, timeout_sec=10)
+            except Exception as e:  # noqa: BLE001
+                LOG.exception('stand failed')
+                raise HTTPException(502, f'stand failed: {type(e).__name__}: {e}') from e
+        return {'ok': True}
+
+    @app.get('/api/cameras')
+    def get_cameras():
+        s = _require_session()
+        from bosdyn.api import image_pb2
+        type_names = {
+            image_pb2.ImageSource.IMAGE_TYPE_VISUAL: 'visual',
+            image_pb2.ImageSource.IMAGE_TYPE_DEPTH: 'depth',
+        }
+        try:
+            sources = s.image_client.list_image_sources()
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f'list_image_sources failed: {e}') from e
+        return [
+            {'name': src.name, 'image_type': type_names.get(src.image_type, 'unknown'),
+             'cols': src.cols, 'rows': src.rows}
+            for src in sources
+        ]
+
+    @app.get('/api/camera/{source}')
+    def get_camera_frame(source: str):
+        """Single JPEG snapshot from an image source. Mainly useful for testing."""
+        s = _require_session()
+        from bosdyn.api import image_pb2
+        from bosdyn.client.image import build_image_request
+        req = [build_image_request(source, image_format=image_pb2.Image.FORMAT_JPEG)]
+        try:
+            resp = s.image_client.get_image(req)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f'get_image failed: {e}') from e
+        if not resp or resp[0].status != image_pb2.ImageResponse.STATUS_OK:
+            raise HTTPException(502, f'image source {source!r} unavailable')
+        return Response(content=resp[0].shot.image.data, media_type='image/jpeg')
+
+    @app.get('/api/camera_stream/{source}')
+    def get_camera_stream(source: str, fps: float = 8.0):
+        """MJPEG stream (multipart/x-mixed-replace) — consumable directly by an <img> tag.
+
+        Pulls a fresh JPEG from the robot's image service on every frame; there's
+        no server-side buffering, so the stream stops as soon as the client
+        disconnects (browser navigates away / tab closes / img.src cleared).
+        """
+        s = _require_session()
+        from bosdyn.api import image_pb2
+        from bosdyn.client.image import build_image_request
+        req = [build_image_request(source, quality_percent=75,
+                                    image_format=image_pb2.Image.FORMAT_JPEG)]
+        period = 1.0 / max(1.0, min(fps, 15.0))
+
+        def frames():
+            while True:
+                start = time.monotonic()
+                try:
+                    resp = s.image_client.get_image(req)
+                except Exception:  # noqa: BLE001 - client disconnect or robot hiccup; just stop
+                    LOG.exception('camera_stream %r: get_image failed, stopping stream', source)
+                    return
+                if resp and resp[0].status == image_pb2.ImageResponse.STATUS_OK:
+                    jpg = resp[0].shot.image.data
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n'
+                           b'Content-Length: ' + str(len(jpg)).encode() + b'\r\n\r\n'
+                           + jpg + b'\r\n')
+                elapsed = time.monotonic() - start
+                time.sleep(max(0.0, period - elapsed))
+
+        return StreamingResponse(frames(), media_type='multipart/x-mixed-replace; boundary=frame')
 
     @app.get('/api/estop/state')
     def get_estop_state():

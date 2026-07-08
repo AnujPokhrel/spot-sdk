@@ -155,6 +155,7 @@ See `loader.fiducial_category` for the source of truth.
 | GET | `/api/robot_state` | `{powered_on, estopped, estop_endpoints}`. |
 | GET | `/api/nav_status` | Current `{state, destination, error?}` from the background nav worker. |
 | POST | `/api/power_on` | Powers on the robot's motors. |
+| POST | `/api/stand` | Blocking stand (`blocking_stand`) — brings Spot to standing height, e.g. to see fiducials mounted above sitting-camera height. |
 | POST | `/api/stop` | Cancels the active nav and sends a `RobotCommandBuilder.stop_command()` (does not estop). |
 | GET | `/api/estop/state` | `{level: 'allowed' \| 'settling' \| 'cut' \| 'unknown', endpoint_registered, any_other_estopped}`. |
 | POST | `/api/estop/allow` | Re-arm motion (clear the software estop). |
@@ -163,6 +164,9 @@ See `loader.fiducial_category` for the source of truth.
 | POST | `/api/graphs/{name}/upload` | Streams `graph` + missing waypoint/edge snapshots to the robot. |
 | POST | `/api/graphs/{name}/localize` | `set_localization` with `FIDUCIAL_INIT_NEAREST`. |
 | POST | `/api/graphs/{name}/navigate/{waypoint_id}` | Starts (or replaces) a background worker that drives Spot to the waypoint. |
+| GET | `/api/cameras` | `[{name, image_type: 'visual' \| 'depth' \| 'unknown', cols, rows}]` from `ImageClient.list_image_sources`. |
+| GET | `/api/camera/{source}` | Single JPEG snapshot from an image source. |
+| GET | `/api/camera_stream/{source}` | MJPEG stream (`multipart/x-mixed-replace`) — an `<img>` tag can point straight at this. Pulls a fresh JPEG from the robot on every frame (default 8 fps, `?fps=` to override up to 15); no server-side buffering, so the stream stops as soon as the client disconnects. |
 
 ## UI tour
 
@@ -191,6 +195,10 @@ See `loader.fiducial_category` for the source of truth.
   - *Drive* (only with `--live`): power-on, upload graph to robot, localize
     via nearest fiducial, toggle "click waypoint to navigate", and a big
     red **STOP** button.
+  - *Cameras* (only with `--live`): pick a body camera and view its live
+    MJPEG feed. Streaming stops automatically when you leave the tab, turn
+    Live off, or navigate away — it only runs while you're actually looking
+    at it.
 
 ## Live mode
 
@@ -220,13 +228,31 @@ yaw. The marker turns gray if the robot isn't localized to the loaded graph.
 ### Typical flow
 
 ```
-1. Click "Power on"                 (Drive tab)
-2. Click "Upload graph to robot"    (only the missing snapshots are streamed)
-3. Click "Localize (nearest fiducial)"  → /api/pose now returns localized:true
-4. Tick "Click waypoint to navigate"
-5. Click any waypoint on the 2D or 3D map → robot drives there
-6. STOP at any time                 (red button — also cancels the worker)
+1. Click "Live: on"                 (header, next to the graph dropdown)
+2. Click "Power on"                 (Drive tab)
+3. Click "Stand"                    (needed if fiducials are above sitting-camera height)
+4. Click "Upload graph to robot"    (only the missing snapshots are streamed)
+5. Click "Localize (nearest fiducial)"  → /api/pose now returns localized:true
+6. Tick "Click waypoint to navigate"
+7. Click any waypoint on the 2D or 3D map → robot drives there
+8. STOP at any time                 (red button — also cancels the worker)
 ```
+
+The header **"Live: on"** toggle and the Drive tab's **"Click waypoint to
+navigate"** checkbox are two different switches — the header toggle starts
+the 5 Hz pose/estop/nav-status polling that everything else in the Drive tab
+depends on, and it resets to "off" on every page reload (the server-side
+session state, like the uploaded graph, persists — this client-side toggle
+does not). Ticking the checkbox without Live being on makes waypoint clicks
+silently do nothing (no request, no dialog — they just fall back to
+select/annotate behavior). The checkbox now flips Live on automatically if
+it isn't already, so step 1 is a safety net rather than a hard requirement.
+
+Do this entirely from the app — never "Acquire" from the tablet to stand the
+robot manually. The server holds the lease and estop endpoint for the whole
+process lifetime (see Safety notes below); the tablet taking control back
+preempts both, which shows up as `LeaseUseError` spam in the server log and
+`502` responses from `/api/power_on` until the tablet releases control again.
 
 ### Why a background nav worker?
 
