@@ -153,9 +153,11 @@ See `loader.fiducial_category` for the source of truth.
 | GET | `/api/live` | `{enabled, hostname, uploaded_graph}` — used by the UI to show/hide the Drive controls. |
 | GET | `/api/pose` | `{x, y, z, yaw, waypoint_id, localized, uploaded_graph}` — `seed_tform_body` from `GraphNavClient.get_localization_state`. |
 | GET | `/api/robot_state` | `{powered_on, estopped, estop_endpoints}`. |
-| GET | `/api/nav_status` | Current `{state, destination, error?}` from the background nav worker. |
+| GET | `/api/nav_status` | Current `{state, destination, heading_deg, sweep, patrol, tilt_deg, error?}` from the background nav worker. `state` is `idle`, `navigating` / `sweeping` / `patrolling` (in progress), `reached`, or a failure (`stuck`, `lost`, `no_route`, `no_localization`, `overridden`, `canceled`, `error`). `heading_deg` is the commanded map-frame heading (`null` = the waypoint's recorded orientation). `sweep` is `null` or `{index, total, phase: 'turning' \| 'dwelling' \| 'done', dwell_s}`. `patrol` is `null` or `{name, index, total, lap, loop, phase: 'driving' \| 'dwelling' \| 'done', dwell_s}`. `tilt_deg` is the last commanded body pitch. |
 | POST | `/api/power_on` | Powers on the robot's motors. |
 | POST | `/api/stand` | Blocking stand (`blocking_stand`) — brings Spot to standing height, e.g. to see fiducials mounted above sitting-camera height. |
+| POST | `/api/sit` | Cancels any nav/sweep/patrol (otherwise its next `navigate_to` would stand Spot back up), then `blocking_sit`. |
+| POST | `/api/tilt?pitch_deg=` | Pitch the body to look up (+) or down (−), max ±30°, via a stand command with `footprint_R_body` pitch. The feet don't move, so heading is unchanged. 409 while a nav/sweep/patrol is running (GraphNav would level the body again). The next nav, stand or sit levels it. |
 | POST | `/api/stop` | Cancels the active nav and sends a `RobotCommandBuilder.stop_command()` (does not estop). |
 | GET | `/api/estop/state` | `{level: 'allowed' \| 'settling' \| 'cut' \| 'unknown', endpoint_registered, any_other_estopped}`. |
 | POST | `/api/estop/allow` | Re-arm motion (clear the software estop). |
@@ -163,7 +165,9 @@ See `loader.fiducial_category` for the source of truth.
 | POST | `/api/estop/cut` | Immediate motor power cut. |
 | POST | `/api/graphs/{name}/upload` | Streams `graph` + missing waypoint/edge snapshots to the robot. |
 | POST | `/api/graphs/{name}/localize` | `set_localization` with `FIDUCIAL_INIT_NEAREST`. |
-| POST | `/api/graphs/{name}/navigate/{waypoint_id}` | Starts (or replaces) a background worker that drives Spot to the waypoint. |
+| POST | `/api/graphs/{name}/navigate/{waypoint_id}` | Starts (or replaces) a background worker that drives Spot to the waypoint. Optional `?heading_deg=` (map frame, 0 = +x, CCW positive) makes it finish on the waypoint facing that heading. If Spot is already there, it just turns in place. See [Look around](#look-around). |
+| POST | `/api/graphs/{name}/patrol` | Run a patrol. JSON body is a `Patrol` (`{name, loop, stops: [{waypoint_id, heading_deg, dwell_s}]}`, same shape as in `annotations.json`). Drives to each stop in order, faces its heading (`null` = recorded orientation), holds `dwell_s`. With `loop`, it starts over until `/api/stop`. A failing stop ends the patrol and is reported in `nav_status`; there's no re-planning. |
+| POST | `/api/graphs/{name}/sweep/{waypoint_id}` | Look-around sweep: faces every `step_deg` heading (default 30) in turn at the waypoint, holding `dwell_s` (default 3) at each. Starts at the step nearest Spot's current heading and goes counter-clockwise. Returns `{headings_deg}`. Replaced by any new navigate/sweep, canceled by `/api/stop`. |
 | GET | `/api/cameras` | `[{name, image_type: 'visual' \| 'depth' \| 'unknown', cols, rows}]` from `ImageClient.list_image_sources`. |
 | GET | `/api/camera/{source}` | Single JPEG snapshot from an image source. |
 | GET | `/api/camera_stream/{source}` | MJPEG stream (`multipart/x-mixed-replace`) — an `<img>` tag can point straight at this. Pulls a fresh JPEG from the robot on every frame (default 8 fps, `?fps=` to override up to 15); no server-side buffering, so the stream stops as soon as the client disconnects. |
@@ -192,9 +196,20 @@ See `loader.fiducial_category` for the source of truth.
   - *Rooms*: "+ New room" → click vertices on the map → double-click to
     close → name it. Waypoint membership auto-fills via point-in-polygon.
   - *No-go*: same polygon flow.
-  - *Drive* (only with `--live`): power-on, upload graph to robot, localize
-    via nearest fiducial, toggle "click waypoint to navigate", and a big
-    red **STOP** button.
+  - *Patrol*: build named patrols (ordered stops: waypoint, heading to
+    face, hold time) by clicking waypoints on the map or "+ Add where Spot
+    is now", reorder with ↑/↓, optionally "Repeat until stopped", then
+    "▶ Run patrol" (live only). The selected patrol is drawn on the 2D map:
+    numbered purple badges, dashed line in stop order, heading arrows, and
+    a cyan ring on the stop in progress. Saved in `annotations.json` with
+    "Save annotations", like rooms and doors.
+  - *Drive* (only with `--live`): a big navigation status banner pinned at
+    the top (**In progress** / **Arrived** / **Unable to complete** with the
+    reason, or **Idle**), power-on, stand, sit, upload graph to robot,
+    localize via nearest fiducial, toggle "click waypoint to navigate", a
+    big red **STOP** button, the **Look around** heading dial + 360° sweep +
+    tilt up/down, and the software e-stop (pinned to the bottom of the panel
+    so it never scrolls out of view).
   - *Cameras* (only with `--live`): pick a body camera and view its live
     MJPEG feed. Streaming stops automatically when you leave the tab, turn
     Live off, or navigate away — it only runs while you're actually looking
@@ -235,7 +250,10 @@ yaw. The marker turns gray if the robot isn't localized to the loaded graph.
 5. Click "Localize (nearest fiducial)"  → /api/pose now returns localized:true
 6. Tick "Click waypoint to navigate"
 7. Click any waypoint on the 2D or 3D map → robot drives there
-8. STOP at any time                 (red button — also cancels the worker)
+8. Look around: click a heading on the dial (or "Sweep 360°") → robot turns on that waypoint;
+   Tilt ▲/▼ pitches the body to look up/down without turning
+9. Or run a saved patrol from the Patrol tab
+10. STOP at any time                (red button — also cancels the worker)
 ```
 
 The header **"Live: on"** toggle and the Drive tab's **"Click waypoint to
@@ -263,6 +281,35 @@ polls `navigation_feedback`. The thread exits on `STATUS_REACHED_GOAL`,
 any failure status (`STUCK`, `LOST`, `NO_ROUTE`, `NO_LOCALIZATION`,
 `COMMAND_OVERRIDDEN`), or on `/api/stop`. Status is exposed via
 `/api/nav_status` and shown in the Drive panel.
+
+### Look around
+
+Once Spot reaches a waypoint, the Drive tab's **Look around** dial turns it
+in place to any of 12 headings (30° steps). **Sweep 360°** visits all 12 in
+turn and holds still for the dwell time at each. The dial targets the
+waypoint Spot just navigated to, or, if it hasn't navigated yet, the waypoint
+it's localized to. In that case it first steps onto that waypoint.
+
+- **Frame.** Headings are in the map (seed) frame, using the same convention
+  as `/api/pose`'s `yaw`: 0° = +x, counter-clockwise positive. The dial is
+  drawn the same way up as the 2D map, so 90° faces "up" on the map. The
+  2D map shows a tick ring around the target waypoint and an orange arrow
+  for the commanded heading.
+- **Mechanism.** No separate turn command is used. It's the same nav worker
+  calling `navigate_to` with `destination_waypoint_tform_body_goal = SE2(0,
+  0, heading − waypoint_yaw)`, so GraphNav plans the turn, keeps
+  localization, avoids obstacles, and reports the usual feedback statuses.
+  GraphNav flattens the waypoint frame before applying that offset, so
+  `waypoint_yaw` is the yaw-only part of the waypoint's rotation
+  (`math_helpers.Quat.to_yaw()`, which matters for waypoints recorded on
+  ramps/stairs). See `heading_goal_in_waypoint()` in `server.py`.
+- **Tolerance.** Heading goals send `TravelParams(max_yaw=5°)`
+  (`HEADING_TOLERANCE_DEG` in `server.py`). GraphNav's default arrival
+  tolerance isn't documented and could swallow a whole 30° step. Plain
+  navigation (no heading) still sends no travel params, unchanged.
+- For unanchored graphs, the UI lays waypoints out by composing edges
+  rather than using the robot's anchoring, so headings follow the drawn
+  map. That may not match the robot's seed frame.
 
 ### Software e-stop
 
@@ -295,8 +342,8 @@ the same backend, so the inline panel and the popup stay in sync.
   registered server-side and stays armed until the server exits or the
   operator presses Settle / Cut. If the server process dies, the
   heartbeat lapses and Spot estops on its own.
-- The robot will only respond to `/navigate` if it's powered on and not
-  estopped. Both are surfaced as 409 errors with explicit messages.
+- The robot will only respond to `/navigate`, `/sweep`, `/patrol` and
+  `/tilt` if it's powered on and not estopped. Both are surfaced as 409 errors with explicit messages.
 - `/upload` is idempotent — re-uploading the same graph only sends snapshots
   the robot is missing.
 

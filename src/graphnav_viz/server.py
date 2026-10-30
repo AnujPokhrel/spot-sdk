@@ -19,7 +19,7 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from . import export, loader
 from .config import AppConfig, load_config
-from .schema import Annotations
+from .schema import Annotations, Patrol
 
 
 class RobotSession:
@@ -69,7 +69,10 @@ class RobotSession:
         # is reached, the route fails, or the user cancels.
         self._nav_thread: threading.Thread | None = None
         self._nav_cancel = threading.Event()
-        self.nav_status: dict = {'state': 'idle', 'destination': None}
+        self.nav_status: dict = make_status('idle')
+        # Last commanded body pitch (deg, + = look up). Any nav, stand or sit
+        # levels the body again, and resets this to 0.
+        self.tilt_deg = 0.0
 
     def shutdown(self) -> None:
         """Release the estop endpoint cleanly so the tablet can resume."""
@@ -81,6 +84,63 @@ class RobotSession:
 LOG = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / 'static'
+
+
+class UIStaticFiles(StaticFiles):
+    """StaticFiles that makes browsers revalidate on every load.
+
+    Without a Cache-Control header, browsers cache by heuristic (~10% of the
+    file's age), so after a UI update they can keep serving months-old
+    index.html/app.js for days. `no-cache` still allows caching, but the
+    browser checks the ETag first, which is a cheap 304 when nothing changed.
+    """
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers['Cache-Control'] = 'no-cache'
+        return response
+
+# Arrival yaw tolerance for "face heading" commands. GraphNav's own default is
+# unspecified and may be loose enough to swallow a whole 30° step, so heading
+# goals always carry an explicit one. Tune on the robot if it hunts.
+HEADING_TOLERANCE_DEG = 5.0
+
+# Body pitch range for "look up/down". Spot clamps body orientation to what it
+# can hold anyway; this keeps the UI's steps within a sane range.
+MAX_TILT_DEG = 30.0
+
+
+def make_status(state: str, destination: str | None = None, heading_deg: float | None = None,
+                *, sweep: dict | None = None, patrol: dict | None = None, **extra) -> dict:
+    """Build a nav_status dict. Every status has the same keys:
+
+    heading_deg is the commanded map-frame heading (None = the waypoint's
+    recorded orientation). sweep / patrol carry progress for those modes and
+    are None otherwise. `extra` is for `error`.
+    """
+    return {'state': state, 'destination': destination, 'heading_deg': heading_deg,
+            'sweep': sweep, 'patrol': patrol, **extra}
+
+
+def quat_yaw(q) -> float:
+    """Yaw (rotation about Z) of a quaternion with .w/.x/.y/.z fields."""
+    return math.atan2(2 * (q.w * q.z + q.x * q.y),
+                      1 - 2 * (q.y * q.y + q.z * q.z))
+
+
+def heading_goal_in_waypoint(wp: dict, heading_deg: float):
+    """SE2Pose proto, relative to waypoint `wp`, that leaves the robot on the
+    waypoint facing `heading_deg` in the map (seed) frame.
+
+    For NavigateTo, GraphNav flattens the waypoint frame before applying
+    `destination_waypoint_tform_body_goal`, so the reference is the waypoint's
+    yaw-only rotation. That's the same decomposition as math_helpers'
+    `Quat.to_yaw()`, and it matters for waypoints recorded on ramps/stairs.
+    """
+    from bosdyn.client.math_helpers import Quat, SE2Pose, recenter_angle_mod
+    wp_yaw = Quat(w=wp['qw'], x=wp['qx'], y=wp['qy'], z=wp['qz']).to_yaw()
+    angle = recenter_angle_mod(math.radians(heading_deg) - wp_yaw, 0.0)
+    return SE2Pose(0.0, 0.0, angle).to_proto()
 
 
 def discover_graphs(root: Path, max_depth: int = 2) -> dict[str, Path]:
@@ -243,10 +303,7 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
         localized = bool(loc.waypoint_id) and (
             seed_T_body.rotation.w != 0 or seed_T_body.rotation.x != 0
             or seed_T_body.rotation.y != 0 or seed_T_body.rotation.z != 0)
-        # Yaw from quaternion (rotation about Z).
-        q = seed_T_body.rotation
-        yaw = math.atan2(2 * (q.w * q.z + q.x * q.y),
-                         1 - 2 * (q.y * q.y + q.z * q.z))
+        yaw = quat_yaw(seed_T_body.rotation)
         return {
             'localized': localized,
             'waypoint_id': loc.waypoint_id,
@@ -286,10 +343,16 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
                 raise HTTPException(502, f'set_localization failed: {e}') from e
         return {'ok': True, 'waypoint_id': resp.waypoint_id}
 
-    def _run_nav_worker(s: RobotSession, destination_id: str) -> None:
-        """Re-issue navigate_to until the robot arrives, fails, or is canceled."""
+    def _drive_until_done(s: RobotSession, cancel: threading.Event, wp: dict,
+                          heading_deg: float | None) -> str:
+        """Re-issue navigate_to until the robot arrives, fails, or `cancel` is set.
+
+        With `heading_deg`, the goal is the waypoint itself rotated to that
+        map-frame heading, so a robot already on the waypoint just turns in
+        place. Returns 'reached', 'canceled', or a failure label; RPC errors
+        propagate to the caller.
+        """
         from bosdyn.api.graph_nav import graph_nav_pb2
-        cmd_id = None
         FAIL_STATES = {
             graph_nav_pb2.NavigationFeedbackResponse.STATUS_LOST: 'lost',
             graph_nav_pb2.NavigationFeedbackResponse.STATUS_STUCK: 'stuck',
@@ -297,59 +360,209 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
             graph_nav_pb2.NavigationFeedbackResponse.STATUS_NO_LOCALIZATION: 'no_localization',
             graph_nav_pb2.NavigationFeedbackResponse.STATUS_COMMAND_OVERRIDDEN: 'overridden',
         }
-        try:
-            while not s._nav_cancel.is_set():
-                try:
-                    cmd_id = s.graph_nav.navigate_to(destination_id, 1.0, command_id=cmd_id)
-                except Exception as e:  # noqa: BLE001
-                    LOG.exception('navigate_to failed mid-route')
-                    s.nav_status = {'state': 'error', 'destination': destination_id,
-                                    'error': f'{type(e).__name__}: {e}'}
-                    return
-                if s._nav_cancel.wait(0.5):
-                    break
-                fb = s.graph_nav.navigation_feedback(cmd_id).status
-                if fb == graph_nav_pb2.NavigationFeedbackResponse.STATUS_REACHED_GOAL:
-                    s.nav_status = {'state': 'reached', 'destination': destination_id}
-                    return
-                if fb in FAIL_STATES:
-                    s.nav_status = {'state': FAIL_STATES[fb], 'destination': destination_id}
-                    return
-            s.nav_status = {'state': 'canceled', 'destination': destination_id}
-        finally:
-            s._nav_thread = None
+        body_goal = travel_params = None
+        if heading_deg is not None:
+            body_goal = heading_goal_in_waypoint(wp, heading_deg)
+            travel_params = graph_nav_pb2.TravelParams(
+                max_yaw=math.radians(HEADING_TOLERANCE_DEG))
+        cmd_id = None
+        while not cancel.is_set():
+            cmd_id = s.graph_nav.navigate_to(
+                wp['id'], 1.0, travel_params=travel_params, command_id=cmd_id,
+                destination_waypoint_tform_body_goal=body_goal)
+            if cancel.wait(0.5):
+                break
+            fb = s.graph_nav.navigation_feedback(cmd_id).status
+            if fb == graph_nav_pb2.NavigationFeedbackResponse.STATUS_REACHED_GOAL:
+                return 'reached'
+            if fb in FAIL_STATES:
+                return FAIL_STATES[fb]
+        return 'canceled'
 
-    @app.post('/api/graphs/{name}/navigate/{waypoint_id}')
-    def post_navigate(name: str, waypoint_id: str):
-        s = _require_session()
+    def _publish(s: RobotSession, status: dict) -> None:
+        # A worker that was replaced by a newer command must not overwrite
+        # the newer command's status.
+        if s._nav_thread is threading.current_thread():
+            s.nav_status = status
+
+    def _run_nav_worker(s: RobotSession, cancel: threading.Event, wp: dict,
+                        heading_deg: float | None) -> None:
+        try:
+            _publish(s, make_status(_drive_until_done(s, cancel, wp, heading_deg),
+                                    wp['id'], heading_deg))
+        except Exception as e:  # noqa: BLE001
+            LOG.exception('navigate_to failed mid-route')
+            _publish(s, make_status('error', wp['id'], heading_deg,
+                                    error=f'{type(e).__name__}: {e}'))
+
+    def _sweep_status(wp: dict, headings: list[float], dwell_s: float,
+                      state: str, i: int, phase: str, **extra) -> dict:
+        return make_status(state, wp['id'], headings[i], **extra,
+                           sweep={'index': i, 'total': len(headings), 'phase': phase,
+                                  'dwell_s': dwell_s})
+
+    def _run_sweep_worker(s: RobotSession, cancel: threading.Event, wp: dict,
+                          headings: list[float], dwell_s: float) -> None:
+        """Face each heading in turn at `wp`, holding still `dwell_s` at each."""
+        i = 0
+        def status(state: str, phase: str, **extra) -> dict:
+            return _sweep_status(wp, headings, dwell_s, state, i, phase, **extra)
+        try:
+            for i in range(len(headings)):
+                _publish(s, status('sweeping', 'turning'))
+                result = _drive_until_done(s, cancel, wp, headings[i])
+                if result != 'reached':
+                    _publish(s, status(result, 'turning'))
+                    return
+                _publish(s, status('sweeping', 'dwelling'))
+                if cancel.wait(dwell_s):
+                    _publish(s, status('canceled', 'dwelling'))
+                    return
+            _publish(s, status('reached', 'done'))
+        except Exception as e:  # noqa: BLE001
+            LOG.exception('look-around sweep failed')
+            _publish(s, status('error', 'turning', error=f'{type(e).__name__}: {e}'))
+
+    def _patrol_status(patrol: Patrol, wps: list[dict], state: str, i: int, lap: int,
+                       phase: str, **extra) -> dict:
+        stop = patrol.stops[i]
+        return make_status(state, wps[i]['id'], stop.heading_deg, **extra,
+                           patrol={'name': patrol.name, 'index': i, 'total': len(wps),
+                                   'lap': lap, 'loop': patrol.loop, 'phase': phase,
+                                   'dwell_s': stop.dwell_s})
+
+    def _run_patrol_worker(s: RobotSession, cancel: threading.Event, patrol: Patrol,
+                           wps: list[dict]) -> None:
+        """Visit each stop in order: drive there, face its heading, hold for its
+        dwell. With `patrol.loop`, start over until canceled or a stop fails."""
+        i, lap = 0, 1
+        def status(state: str, phase: str, **extra) -> dict:
+            return _patrol_status(patrol, wps, state, i, lap, phase, **extra)
+        try:
+            while True:
+                for i, stop in enumerate(patrol.stops):
+                    _publish(s, status('patrolling', 'driving'))
+                    result = _drive_until_done(s, cancel, wps[i], stop.heading_deg)
+                    if result != 'reached':
+                        _publish(s, status(result, 'driving'))
+                        return
+                    _publish(s, status('patrolling', 'dwelling'))
+                    if cancel.wait(stop.dwell_s):
+                        _publish(s, status('canceled', 'dwelling'))
+                        return
+                if not patrol.loop:
+                    break
+                lap += 1
+            _publish(s, status('reached', 'done'))
+        except Exception as e:  # noqa: BLE001
+            LOG.exception('patrol %r failed', patrol.name)
+            _publish(s, status('error', 'driving', error=f'{type(e).__name__}: {e}'))
+
+    def _start_worker(s: RobotSession, initial_status: dict, target, *args) -> None:
+        """Cancel any running nav/sweep/patrol worker, then run `target(s, cancel, *args)`."""
+        if s._nav_thread and s._nav_thread.is_alive():
+            s._nav_cancel.set()
+            s._nav_thread.join(timeout=2.0)
+        # Each worker watches its own event, so one that outlives the join
+        # above still sees its cancel instead of the replacement's.
+        cancel = s._nav_cancel = threading.Event()
+
+        def run():
+            try:
+                target(s, cancel, *args)
+            finally:
+                if s._nav_thread is threading.current_thread():
+                    s._nav_thread = None
+
+        s.nav_status = initial_status
+        s.tilt_deg = 0.0   # GraphNav levels the body when it takes over
+        t = threading.Thread(target=run, name=f'nav-{initial_status["destination"][:8]}',
+                             daemon=True)
+        s._nav_thread = t
+        t.start()
+
+    def _require_uploaded(s: RobotSession, name: str) -> loader.GraphData:
         if s.uploaded_graph != name:
             raise HTTPException(409, f'graph {name!r} is not uploaded; upload first.')
-        _, gd = _get(name)
+        return _get(name)[1]
+
+    def _find_waypoint(gd: loader.GraphData, waypoint_id: str) -> dict:
         wp = next((w for w in gd.waypoints
                    if w['id'] == waypoint_id or w['name'] == waypoint_id), None)
         if wp is None:
             raise HTTPException(404, f'waypoint {waypoint_id!r} not in graph')
+        return wp
+
+    def _require_can_move(s: RobotSession) -> None:
         if s.robot.is_estopped():
-            raise HTTPException(409, 'Robot is e-stopped. Release the e-stop before navigating.')
+            raise HTTPException(409, 'Robot is e-stopped. Release the e-stop first.')
         if not s.robot.is_powered_on():
             raise HTTPException(409, 'Robot motors are off. Click "Power on" in the Drive tab first.')
 
-        # Cancel any existing navigation before starting a new one.
-        if s._nav_thread and s._nav_thread.is_alive():
-            s._nav_cancel.set()
-            s._nav_thread.join(timeout=2.0)
-        s._nav_cancel = threading.Event()
-        s.nav_status = {'state': 'navigating', 'destination': wp['id']}
-        t = threading.Thread(target=_run_nav_worker, args=(s, wp['id']),
-                             name=f'nav-{wp["id"][:8]}', daemon=True)
-        s._nav_thread = t
-        t.start()
-        return {'ok': True, 'destination': wp['id']}
+    def _nav_target(s: RobotSession, name: str, waypoint_id: str) -> dict:
+        """Resolve a waypoint for a motion command and check the robot can move."""
+        wp = _find_waypoint(_require_uploaded(s, name), waypoint_id)
+        _require_can_move(s)
+        return wp
+
+    @app.post('/api/graphs/{name}/navigate/{waypoint_id}')
+    def post_navigate(name: str, waypoint_id: str, heading_deg: float | None = None):
+        """Drive to a waypoint. With `heading_deg` (map frame: 0 = +x, CCW
+        positive), finish on the waypoint facing that heading instead of its
+        recorded orientation; if already there, Spot just turns in place."""
+        s = _require_session()
+        if heading_deg is not None:
+            if not math.isfinite(heading_deg):
+                raise HTTPException(422, 'heading_deg must be a finite number.')
+            heading_deg %= 360.0
+        wp = _nav_target(s, name, waypoint_id)
+        _start_worker(s, make_status('navigating', wp['id'], heading_deg),
+                      _run_nav_worker, wp, heading_deg)
+        return {'ok': True, 'destination': wp['id'], 'heading_deg': heading_deg}
+
+    @app.post('/api/graphs/{name}/sweep/{waypoint_id}')
+    def post_sweep(name: str, waypoint_id: str, step_deg: float = 30.0, dwell_s: float = 3.0):
+        """Look around a full circle at a waypoint: face every `step_deg`
+        heading in turn (map frame), holding `dwell_s` at each. Starts at the
+        step nearest the robot's current heading and goes counter-clockwise,
+        so every turn is exactly one step."""
+        s = _require_session()
+        count = round(360.0 / step_deg) if step_deg > 0 else 0
+        if not 2 <= count <= 72 or abs(count * step_deg - 360.0) > 1e-6:
+            raise HTTPException(422, 'step_deg must divide 360 evenly (5 to 180).')
+        if not 0 <= dwell_s <= 120:
+            raise HTTPException(422, 'dwell_s must be between 0 and 120 seconds.')
+        wp = _nav_target(s, name, waypoint_id)
+        try:
+            seed_T_body = s.graph_nav.get_localization_state().localization.seed_tform_body
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f'get_localization_state failed: {e}') from e
+        start = round(math.degrees(quat_yaw(seed_T_body.rotation)) / step_deg) * step_deg
+        headings = [(start + i * step_deg) % 360.0 for i in range(count)]
+        _start_worker(s, _sweep_status(wp, headings, dwell_s, 'sweeping', 0, 'turning'),
+                      _run_sweep_worker, wp, headings, dwell_s)
+        return {'ok': True, 'destination': wp['id'], 'headings_deg': headings}
+
+    @app.post('/api/graphs/{name}/patrol')
+    def post_patrol(name: str, patrol: Patrol):
+        """Run a patrol: visit its stops in order, facing each stop's heading
+        and holding for its dwell, then stop (or start over if `loop`). A stop
+        that fails (stuck, no route, ...) ends the patrol and is reported in
+        nav_status. There's no re-planning around it."""
+        s = _require_session()
+        if not patrol.stops:
+            raise HTTPException(422, 'patrol has no stops.')
+        gd = _require_uploaded(s, name)
+        wps = [_find_waypoint(gd, stop.waypoint_id) for stop in patrol.stops]
+        _require_can_move(s)
+        _start_worker(s, _patrol_status(patrol, wps, 'patrolling', 0, 1, 'driving'),
+                      _run_patrol_worker, patrol, wps)
+        return {'ok': True, 'stops': len(wps)}
 
     @app.get('/api/nav_status')
     def get_nav_status():
         s = _require_session()
-        return s.nav_status
+        return {**s.nav_status, 'tilt_deg': s.tilt_deg}
 
     @app.get('/api/robot_state')
     def get_robot_state():
@@ -393,7 +606,50 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
             except Exception as e:  # noqa: BLE001
                 LOG.exception('stand failed')
                 raise HTTPException(502, f'stand failed: {type(e).__name__}: {e}') from e
+        s.tilt_deg = 0.0
         return {'ok': True}
+
+    @app.post('/api/sit')
+    def post_sit():
+        s = _require_session()
+        from bosdyn.client.robot_command import blocking_sit
+        # Stop any nav/sweep/patrol first, or its next navigate_to would stand
+        # Spot right back up.
+        s._nav_cancel.set()
+        with s._lock:
+            try:
+                blocking_sit(s.command_client, timeout_sec=10)
+            except Exception as e:  # noqa: BLE001
+                LOG.exception('sit failed')
+                raise HTTPException(502, f'sit failed: {type(e).__name__}: {e}') from e
+        s.tilt_deg = 0.0
+        return {'ok': True}
+
+    @app.post('/api/tilt')
+    def post_tilt(pitch_deg: float = 0.0):
+        """Pitch the body to look up (+) or down (-) while standing in place.
+        The feet don't move, so the heading is unchanged. The next nav, stand
+        or sit levels the body again."""
+        s = _require_session()
+        if not math.isfinite(pitch_deg) or abs(pitch_deg) > MAX_TILT_DEG:
+            raise HTTPException(422, f'pitch_deg must be within +/-{MAX_TILT_DEG:g}.')
+        if s._nav_thread and s._nav_thread.is_alive():
+            # GraphNav would override the stand command on its next re-issue.
+            raise HTTPException(409, 'Spot is moving. Wait until it arrives, or press STOP first.')
+        _require_can_move(s)
+        from bosdyn import geometry
+        from bosdyn.client.robot_command import RobotCommandBuilder
+        # EulerZXY pitch is nose-down positive; this endpoint is look-up positive.
+        cmd = RobotCommandBuilder.synchro_stand_command(
+            footprint_R_body=geometry.EulerZXY(yaw=0.0, roll=0.0, pitch=-math.radians(pitch_deg)))
+        with s._lock:
+            try:
+                s.command_client.robot_command(cmd)
+            except Exception as e:  # noqa: BLE001
+                LOG.exception('tilt failed')
+                raise HTTPException(502, f'tilt failed: {type(e).__name__}: {e}') from e
+        s.tilt_deg = pitch_deg
+        return {'ok': True, 'tilt_deg': pitch_deg}
 
     @app.get('/api/cameras')
     def get_cameras():
@@ -529,10 +785,10 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
                 s.command_client.robot_command(RobotCommandBuilder.stop_command())
             except Exception as e:  # noqa: BLE001
                 raise HTTPException(502, f'stop failed: {e}') from e
-        s.nav_status = {'state': 'canceled', 'destination': s.nav_status.get('destination')}
+        s.nav_status = make_status('canceled', s.nav_status.get('destination'))
         return {'ok': True}
 
-    app.mount('/', StaticFiles(directory=str(STATIC_DIR), html=True), name='static')
+    app.mount('/', UIStaticFiles(directory=str(STATIC_DIR), html=True), name='static')
     return app
 
 

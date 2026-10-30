@@ -42,6 +42,7 @@
         <button class="tab" data-tab="doors">Doors</button>
         <button class="tab" data-tab="rooms">Rooms</button>
         <button class="tab" data-tab="nogo">No-go</button>
+        <button class="tab" data-tab="patrol">Patrol</button>
         <button class="tab" data-tab="drive" id="tab-drive" hidden>Drive</button>
         <button class="tab" data-tab="cameras" id="tab-cameras" hidden>Cameras</button>
       </nav>
@@ -70,12 +71,42 @@
         <button id="nogo-new">+ New no-go zone</button>
         <div id="nogo-list"></div>
       </section>
+      <section id="panel-patrol" class="panel">
+        <h2>Patrol</h2>
+        <div class="row">
+          <select id="patrol-select" hidden></select>
+          <button id="patrol-new">+ New patrol</button>
+        </div>
+        <div id="patrol-empty" class="muted">No patrols for this map yet.</div>
+        <div id="patrol-editor" hidden>
+          <label>Name <input id="patrol-name" /></label>
+          <label><input type="checkbox" id="patrol-add-mode" /> Click waypoints on the map to add stops</label>
+          <ol id="patrol-stops"></ol>
+          <div id="patrol-stops-empty" class="muted" style="margin-bottom:0.6rem;">No stops yet.</div>
+          <div class="row">
+            <button id="patrol-add-here" hidden title="Add the waypoint Spot is at, facing its current heading">+ Add where Spot is now</button>
+          </div>
+          <label><input type="checkbox" id="patrol-loop" /> Repeat until stopped</label>
+          <div class="row">
+            <button id="patrol-run" hidden>▶ Run patrol</button>
+            <button id="patrol-stop" class="delete" hidden>STOP</button>
+          </div>
+          <div id="patrol-status" class="muted"></div>
+          <div class="muted">Edits are kept until you click "Save annotations".</div>
+          <button id="patrol-delete" class="delete" style="margin-top:0.8rem;">Delete patrol</button>
+        </div>
+      </section>
       <section id="panel-drive" class="panel">
         <h2>Drive</h2>
+        <div id="nav-banner" class="idle" role="status" aria-live="polite">
+          <div id="nav-banner-label">Idle</div>
+          <div id="nav-banner-detail">Turn Live on to see navigation status.</div>
+        </div>
         <div id="drive-status" class="muted">Live mode is off.</div>
         <div class="row">
           <button id="drive-power-on">Power on</button>
           <button id="drive-stand" style="background: #2b6cb0;">Stand</button>
+          <button id="drive-sit" style="background: #2b6cb0;">Sit</button>
           <button id="drive-upload">Upload graph to robot</button>
           <button id="drive-localize">Localize (nearest fiducial)</button>
         </div>
@@ -85,12 +116,31 @@
         </label>
         <button id="drive-stop" class="delete" style="margin-top:0.8rem;">STOP (cancel nav)</button>
         <hr style="border:0; border-top:1px solid #333; margin:1rem 0;" />
-        <h3 style="margin:0 0 0.5rem; font-size:12px; color:#a0aec0; text-transform:uppercase; letter-spacing:0.05em;">Software E-Stop</h3>
-        <div id="estop-status" class="muted">—</div>
-        <button id="estop-settle" class="estop-soft" style="margin-top:0.5rem; width:100%;">Settle-then-cut</button>
-        <button id="estop-cut" class="estop-hard" style="margin-top:0.4rem; width:100%;">Hard cut</button>
-        <button id="estop-allow" class="estop-allow" style="margin-top:0.4rem; width:100%;" disabled>Allow / re-arm</button>
-        <a id="estop-popout" href="#" style="display:inline-block; margin-top:0.6rem; font-size:12px; color:#63b3ed;">↗ Pop out e-stop</a>
+        <h3 style="margin:0 0 0.5rem; font-size:12px; color:#a0aec0; text-transform:uppercase; letter-spacing:0.05em;">Look around</h3>
+        <div id="look-target" class="muted">—</div>
+        <svg id="look-dial" class="disabled" viewBox="0 0 220 220" role="group" aria-label="Heading dial"></svg>
+        <div id="look-heading" class="muted">Map frame, oriented like the 2D map: 0° → right, 90° ↑ up.</div>
+        <div class="row" style="margin-top:0.5rem; align-items:center;">
+          <label class="muted">Dwell <input id="look-dwell" type="number" min="0" max="120" step="0.5" value="3" /> s</label>
+          <button id="look-sweep" disabled>Sweep 360°</button>
+        </div>
+        <div class="row" style="margin-top:0.5rem; align-items:center;">
+          <span class="muted">Tilt</span>
+          <button id="look-tilt-up" disabled title="Pitch the body up (feet and heading stay put)">▲ Up</button>
+          <button id="look-tilt-level" disabled>Level</button>
+          <button id="look-tilt-down" disabled title="Pitch the body down (feet and heading stay put)">▼ Down</button>
+          <span id="look-tilt" class="muted">level</span>
+        </div>
+        <!-- Sticky so the e-stop never scrolls out of view on short screens. -->
+        <div id="estop-block">
+          <hr style="border:0; border-top:1px solid #333; margin:1rem 0;" />
+          <h3 style="margin:0 0 0.5rem; font-size:12px; color:#a0aec0; text-transform:uppercase; letter-spacing:0.05em;">Software E-Stop</h3>
+          <div id="estop-status" class="muted">—</div>
+          <button id="estop-settle" class="estop-soft" style="margin-top:0.5rem; width:100%;">Settle-then-cut</button>
+          <button id="estop-cut" class="estop-hard" style="margin-top:0.4rem; width:100%;">Hard cut</button>
+          <button id="estop-allow" class="estop-allow" style="margin-top:0.4rem; width:100%;" disabled>Allow / re-arm</button>
+          <a id="estop-popout" href="#" style="display:inline-block; margin-top:0.6rem; font-size:12px; color:#63b3ed;">↗ Pop out e-stop</a>
+        </div>
       </section>
       <section id="panel-cameras" class="panel">
         <h2>Cameras</h2>

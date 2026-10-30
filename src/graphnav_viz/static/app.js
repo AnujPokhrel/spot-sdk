@@ -4,8 +4,11 @@ import { Map2D } from './map2d.js';
 const state = {
   graphName: null,
   graph: null,
-  annotations: { doors: [], waypoint_pois: {}, rooms: [], no_go_zones: [] },
+  annotations: { doors: [], waypoint_pois: {}, rooms: [], no_go_zones: [], patrols: [] },
   selectedWaypointId: null,
+  patrolIdx: 0,         // selected patrol in annotations.patrols
+  patrolAddMode: false, // map clicks append stops to the selected patrol
+  patrolOverlay: null,  // { stops, loop, current } drawn by map2d; null = hidden
   view: '2d',
   map2d: null, map3d: null,
   scans: null,        // Float32Array (Nx3) in seed frame, lazy-loaded
@@ -19,6 +22,7 @@ const state = {
     mode: 'select',     // 'select' | 'drive' — drive sends nav commands on waypoint click
     uploadedGraph: null,
     pollTimer: null,
+    look: null,         // { waypointId, headingDeg, stepDeg } for the 2D overlay; null = hidden
   },
 };
 
@@ -108,6 +112,9 @@ async function loadGraph(name) {
   renderDoors();
   renderRooms();
   renderNoGo();
+  state.patrolIdx = 0;
+  setPatrolAddMode(false);
+  renderPatrols();
 }
 
 // --- Tabs ---
@@ -122,11 +129,20 @@ document.querySelectorAll('#tabs .tab').forEach(tab => {
     } else {
       stopCameraStream();
     }
+    // Adding stops by map click only makes sense while the patrol is on screen.
+    if (tab.dataset.tab !== 'patrol') setPatrolAddMode(false);
+    refreshPatrolOverlay();
+    state.map2d?.draw();
   });
 });
 
 // --- Waypoint panel ---
 function selectWaypoint(wp) {
+  if (state.patrolAddMode && currentPatrol()) {
+    addPatrolStop(wp.id);
+    setStatus(`Added stop ${currentPatrol().stops.length}: ${waypointLabel(wp.id)} (unsaved)`);
+    return;
+  }
   if (state.live.enabled && state.live.mode === 'drive') {
     if (state.live.uploadedGraph !== state.graphName) {
       setStatus('Upload graph to robot first (Drive tab).');
@@ -453,6 +469,65 @@ document.getElementById('view-toggle').addEventListener('click', async () => {
 
 // --- Live mode ---
 
+function navStatusText(ns) {
+  let t = ns.state;
+  if (ns.heading_deg != null) t += ` → ${Math.round(ns.heading_deg)}°`;
+  if (ns.sweep) t += ` (sweep ${ns.sweep.index + 1}/${ns.sweep.total}, ${ns.sweep.phase})`;
+  if (ns.patrol) {
+    const p = ns.patrol;
+    t += ` (patrol ${p.name} ${p.index + 1}/${p.total}${p.loop ? `, lap ${p.lap}` : ''}, ${p.phase})`;
+  }
+  if (ns.error) t += ` (${ns.error})`;
+  return t;
+}
+
+// One big indicator for the operator. Every nav state collapses into
+// in progress / arrived / unable to complete, plus idle before any command.
+const NAV_BANNER_KIND = {
+  navigating: 'progress', sweeping: 'progress', patrolling: 'progress',
+  reached: 'arrived', idle: 'idle',
+};   // anything else (stuck, lost, no_route, canceled, error, ...) → 'unable'
+const NAV_BANNER_LABEL = {
+  progress: 'In progress', arrived: 'Arrived', unable: 'Unable to complete', idle: 'Idle',
+};
+const NAV_FAIL_REASON = {
+  stuck: 'Spot is stuck', lost: 'Spot got lost', no_route: 'No route to the goal',
+  no_localization: 'Spot is not localized', overridden: 'Overridden by another command',
+  canceled: 'Stopped by operator', error: 'Robot error',
+};
+
+function updateNavBanner() {
+  const el = document.getElementById('nav-banner');
+  const ns = state.live.enabled ? state.live.navStatus : null;
+  const kind = ns ? (NAV_BANNER_KIND[ns.state] || 'unable') : 'idle';
+  el.className = kind;
+  document.getElementById('nav-banner-label').textContent = NAV_BANNER_LABEL[kind];
+
+  let detail;
+  if (!ns) {
+    detail = 'Turn Live on to see navigation status.';
+  } else if (kind === 'idle') {
+    detail = 'No navigation command yet.';
+  } else {
+    const wp = ns.destination ? waypointLabel(ns.destination) : null;
+    const face = ns.heading_deg != null ? `, facing ${Math.round(ns.heading_deg)}°` : '';
+    const p = ns.patrol, sw = ns.sweep;
+    let what = wp ? `${wp}${face}` : '';
+    if (p) what = `Patrol "${p.name}" stop ${p.index + 1}/${p.total}${p.loop ? ` (lap ${p.lap})` : ''}: ${what}`;
+    else if (sw) what = `Look-around ${sw.index + 1}/${sw.total} at ${what}`;
+    if (kind === 'progress') {
+      const holding = (p || sw)?.phase === 'dwelling';
+      detail = p || sw ? `${what}${holding ? ', holding' : ''}` : `Going to ${what}`;
+    } else if (kind === 'arrived') {
+      detail = p ? `Patrol "${p.name}" finished at ${wp}` : sw ? `Look-around done at ${wp}` : `At ${what}`;
+    } else {
+      const reason = NAV_FAIL_REASON[ns.state] || ns.state;
+      detail = `${reason}${what ? `: ${what}` : ''}${ns.error ? ` (${ns.error})` : ''}`;
+    }
+  }
+  document.getElementById('nav-banner-detail').textContent = detail;
+}
+
 function updateDriveStatusUI() {
   const el = document.getElementById('drive-status');
   if (!state.live.available) {
@@ -465,7 +540,7 @@ function updateDriveStatusUI() {
     `Uploaded graph: ${state.live.uploadedGraph || '(none)'}`,
     matches ? 'Loaded graph matches uploaded.' : 'Loaded graph does NOT match uploaded — upload it before navigating.',
     state.live.pose?.localized ? `Localized at ${state.live.pose.waypoint_id.slice(0, 8)}…` : 'Not localized.',
-    state.live.navStatus ? `Nav: ${state.live.navStatus.state}${state.live.navStatus.error ? ` (${state.live.navStatus.error})` : ''}` : '',
+    state.live.navStatus ? `Nav: ${navStatusText(state.live.navStatus)}` : '',
   ];
   el.innerHTML = parts.join('<br>');
 }
@@ -485,7 +560,11 @@ async function pollPose() {
     state.live.estop = await fetch('/api/estop/state').then(r => r.json());
   } catch { state.live.estop = null; }
   updateDriveStatusUI();
+  updateNavBanner();
   updateEstopUI();
+  updateLookUI();
+  refreshPatrolOverlay();
+  updatePatrolUI();
   state.map2d?.draw();
   state.map3d?.setLivePose?.(state.live.pose);
   // Update header badge
@@ -516,6 +595,9 @@ document.getElementById('live-toggle').addEventListener('click', () => {
     state.live.pollTimer = null;
     state.live.pose = null;
     document.getElementById('live-badge').hidden = true;
+    updateNavBanner();
+    updateLookUI();
+    refreshPatrolOverlay();
     state.map2d?.draw();
     state.map3d?.setLivePose?.(null);
     stopCameraStream();
@@ -554,6 +636,17 @@ document.getElementById('drive-stand').addEventListener('click', async () => {
   }
 });
 
+document.getElementById('drive-sit').addEventListener('click', async () => {
+  setStatus('Sitting…');
+  try {
+    const r = await fetch('/api/sit', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    setStatus(r.ok ? 'Sitting' : `Sit failed: ${j.detail || r.status}`);
+  } catch (e) {
+    setStatus('Network error while trying to sit.');
+  }
+});
+
 document.getElementById('drive-upload').addEventListener('click', async () => {
   if (!state.graphName) return;
   setStatus('Uploading graph to robot…');
@@ -574,6 +667,374 @@ document.getElementById('drive-localize').addEventListener('click', async () => 
 });
 
 document.getElementById('drive-stop').addEventListener('click', async () => {
+  const r = await fetch('/api/stop', { method: 'POST' });
+  setStatus(r.ok ? 'STOP sent' : 'STOP failed');
+});
+
+// --- Look around ---
+// Turn in place to a map-frame heading at the waypoint the robot just reached
+// (or, before any nav, the waypoint it's localized to). Headings use the same
+// convention as pose.yaw: 0° = map +x, counter-clockwise positive. The dial is
+// drawn in the 2D map's orientation, so where a button sits on the dial is
+// where Spot will face on the map. The server turns heading → GraphNav goal.
+const HEADING_STEP_DEG = 30;
+const LOOK_ACTIVE_STATES = ['navigating', 'sweeping', 'patrolling', 'reached'];
+const MOVING_STATES = ['navigating', 'sweeping', 'patrolling'];
+const TILT_STEP_DEG = 10, MAX_TILT_DEG = 30;   // server rejects beyond ±30
+const DIAL_C = 110, DIAL_R = 84;   // SVG viewBox is 220×220
+
+function buildLookDial() {
+  const c = DIAL_C, r = DIAL_R;
+  let html = `<circle class="ring" cx="${c}" cy="${c}" r="${r}"/>
+    <g id="look-needle" visibility="hidden">
+      <line x1="${c}" y1="${c}" x2="${c + r - 30}" y2="${c}"/>
+      <polygon points="${c + r - 20},${c} ${c + r - 32},${c - 6} ${c + r - 32},${c + 6}"/>
+    </g>
+    <circle class="hub" cx="${c}" cy="${c}" r="4"/>`;
+  for (let h = 0; h < 360; h += HEADING_STEP_DEG) {
+    const a = h * Math.PI / 180;
+    const x = c + r * Math.cos(a), y = c - r * Math.sin(a);   // SVG y is down
+    html += `<g class="heading" data-heading="${h}" transform="translate(${x.toFixed(1)} ${y.toFixed(1)})">
+      <title>Face ${h}°</title><circle r="15"/><text>${h}°</text></g>`;
+  }
+  const svg = document.getElementById('look-dial');
+  svg.innerHTML = html;
+  svg.querySelectorAll('.heading').forEach(g =>
+    g.addEventListener('click', () => lookAt(Number(g.dataset.heading))));
+}
+
+function lookTargetId() {
+  const ns = state.live.navStatus;
+  if (ns?.destination && LOOK_ACTIVE_STATES.includes(ns.state)) return ns.destination;
+  return state.live.pose?.localized ? state.live.pose.waypoint_id : null;
+}
+
+function waypointLabel(id) {
+  const wp = state.graph?.waypoints.find(w => w.id === id);
+  return state.annotations.waypoint_pois[id]?.name || wp?.name || id.slice(0, 8);
+}
+
+function updateLookUI() {
+  const pose = state.live.pose, ns = state.live.navStatus;
+  const id = state.live.enabled ? lookTargetId() : null;
+  const ready = !!id && state.live.uploadedGraph === state.graphName
+    && !!state.graph?.waypoints.some(w => w.id === id);
+  const active = ready && ns?.destination === id && LOOK_ACTIVE_STATES.includes(ns.state);
+  const heading = active ? ns.heading_deg : null;
+  const settled = active && (ns.state === 'reached' || ns.sweep?.phase === 'dwelling'
+    || ns.patrol?.phase === 'dwelling');
+  state.live.look = ready ? { waypointId: id, headingDeg: heading, stepDeg: HEADING_STEP_DEG } : null;
+
+  const svg = document.getElementById('look-dial');
+  svg.classList.toggle('disabled', !ready);
+  document.getElementById('look-sweep').disabled = !ready;
+  svg.querySelectorAll('.heading').forEach(g => {
+    const on = heading != null && Number(g.dataset.heading) === Math.round(heading) % 360;
+    g.classList.toggle('active', on && !settled);
+    g.classList.toggle('reached', on && settled);
+  });
+
+  const needle = document.getElementById('look-needle');
+  const headingEl = document.getElementById('look-heading');
+  const hint = '0° → right, 90° ↑ up, as on the 2D map.';
+  if (state.live.enabled && pose?.localized) {
+    const deg = pose.yaw * 180 / Math.PI;
+    needle.setAttribute('visibility', 'visible');
+    needle.setAttribute('transform', `rotate(${(-deg).toFixed(1)} ${DIAL_C} ${DIAL_C})`);
+    headingEl.textContent = `Robot heading ${Math.round((deg + 360) % 360)}° (cyan). ${hint}`;
+  } else {
+    needle.setAttribute('visibility', 'hidden');
+    headingEl.textContent = `Map frame. ${hint}`;
+  }
+
+  // Tilt needs only a live, standing robot, not localization. Disabled while
+  // moving because GraphNav re-levels the body on every command it re-issues.
+  const tilt = ns?.tilt_deg ?? 0;
+  const canTilt = state.live.enabled && !MOVING_STATES.includes(ns?.state);
+  document.getElementById('look-tilt-up').disabled = !canTilt || tilt >= MAX_TILT_DEG;
+  document.getElementById('look-tilt-level').disabled = !canTilt || tilt === 0;
+  document.getElementById('look-tilt-down').disabled = !canTilt || tilt <= -MAX_TILT_DEG;
+  document.getElementById('look-tilt').textContent =
+    tilt > 0 ? `${tilt}° up` : tilt < 0 ? `${-tilt}° down` : 'level';
+
+  const targetEl = document.getElementById('look-target');
+  if (!state.live.enabled) { targetEl.textContent = 'Turn Live on to use.'; return; }
+  if (!id) { targetEl.textContent = 'Localize the robot first.'; return; }
+  if (!ready) { targetEl.textContent = 'Upload this graph to the robot first.'; return; }
+  let detail;
+  if (!active) {
+    detail = 'Localized here, not navigated. A turn first steps onto this waypoint.';
+  } else if (ns.patrol) {
+    const p = ns.patrol;
+    detail = `Patrol "${p.name}" stop ${p.index + 1}/${p.total}: ${p.phase}`
+      + (heading != null ? `, facing ${Math.round(heading)}°` : '');
+  } else if (ns.sweep) {
+    const step = `Sweep ${ns.sweep.index + 1}/${ns.sweep.total}`;
+    detail = ns.state === 'reached' ? `${step} done.`
+      : `${step}: ${ns.sweep.phase === 'dwelling' ? `holding ${ns.sweep.dwell_s}s at` : 'turning to'} ${Math.round(heading)}°`;
+  } else if (ns.state === 'reached') {
+    detail = heading != null ? `Arrived, facing ${Math.round(heading)}°.` : 'Arrived. Pick a heading to face.';
+  } else {
+    detail = heading != null ? `Going to face ${Math.round(heading)}°…` : 'En route. Pick a heading to face on arrival.';
+  }
+  targetEl.textContent = `Waypoint ${waypointLabel(id)}\n${detail}`;
+}
+
+async function lookAt(heading) {
+  const id = lookTargetId();
+  if (!id) return;
+  setStatus(`Turning to ${heading}° at ${waypointLabel(id)}…`);
+  const r = await api(`/navigate/${encodeURIComponent(id)}?heading_deg=${heading}`, { method: 'POST' });
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    setStatus(`Turn failed: ${j.detail || r.status}`);
+  }
+}
+
+document.getElementById('look-sweep').addEventListener('click', async () => {
+  const id = lookTargetId();
+  if (!id) return;
+  const dwell = Math.max(0, parseFloat(document.getElementById('look-dwell').value) || 0);
+  const n = 360 / HEADING_STEP_DEG;
+  if (!confirm(`Turn Spot through all ${n} headings at ${waypointLabel(id)}, holding ${dwell}s at each?`)) return;
+  const r = await api(`/sweep/${encodeURIComponent(id)}?step_deg=${HEADING_STEP_DEG}&dwell_s=${dwell}`,
+    { method: 'POST' });
+  const j = await r.json().catch(() => ({}));
+  setStatus(r.ok ? `Sweeping ${n} headings at ${waypointLabel(id)}` : `Sweep failed: ${j.detail || r.status}`);
+});
+
+async function tiltTo(deg) {
+  deg = Math.max(-MAX_TILT_DEG, Math.min(MAX_TILT_DEG, deg));
+  const r = await fetch(`/api/tilt?pitch_deg=${deg}`, { method: 'POST' });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { setStatus(`Tilt failed: ${j.detail || r.status}`); return; }
+  // Don't wait for the next poll, so quick repeated clicks keep stepping.
+  if (state.live.navStatus) state.live.navStatus.tilt_deg = deg;
+  updateLookUI();
+  setStatus(deg ? `Looking ${deg > 0 ? 'up' : 'down'} ${Math.abs(deg)}°` : 'Body level');
+}
+const currentTilt = () => state.live.navStatus?.tilt_deg ?? 0;
+document.getElementById('look-tilt-up').addEventListener('click', () => tiltTo(currentTilt() + TILT_STEP_DEG));
+document.getElementById('look-tilt-level').addEventListener('click', () => tiltTo(0));
+document.getElementById('look-tilt-down').addEventListener('click', () => tiltTo(currentTilt() - TILT_STEP_DEG));
+
+buildLookDial();
+updateLookUI();
+
+// --- Patrol ---
+// A patrol is an ordered list of stops {waypoint_id, heading_deg, dwell_s},
+// saved in annotations.json with the map's other annotations. Running one
+// sends the in-memory copy (saved or not); the server drives to each stop,
+// faces its heading (null = the waypoint's recorded orientation) and holds
+// for its dwell, on the same worker as navigate / look-around.
+const DEFAULT_DWELL_S = 5;
+
+function currentPatrol() {
+  return state.annotations.patrols[state.patrolIdx] || null;
+}
+
+function setPatrolAddMode(on) {
+  state.patrolAddMode = on;
+  document.getElementById('patrol-add-mode').checked = on;
+}
+
+function renderPatrols() {
+  const patrols = state.annotations.patrols;
+  state.patrolIdx = Math.min(Math.max(state.patrolIdx, 0), patrols.length - 1);
+  const sel = document.getElementById('patrol-select');
+  sel.innerHTML = '';
+  patrols.forEach((p, i) => sel.add(new Option(p.name || `(unnamed ${i + 1})`, i)));
+  sel.value = String(state.patrolIdx);
+  sel.hidden = !patrols.length;
+  const p = currentPatrol();
+  document.getElementById('patrol-empty').hidden = !!p;
+  document.getElementById('patrol-editor').hidden = !p;
+  if (!p) {
+    setPatrolAddMode(false);
+    refreshPatrolOverlay();
+    return;
+  }
+  document.getElementById('patrol-name').value = p.name;
+  document.getElementById('patrol-loop').checked = !!p.loop;
+  renderPatrolStops();
+}
+
+function headingSelect(selected) {
+  const sel = document.createElement('select');
+  sel.add(new Option('as recorded', ''));
+  for (let h = 0; h < 360; h += HEADING_STEP_DEG) sel.add(new Option(`${h}°`, h));
+  if (selected != null && selected % HEADING_STEP_DEG) sel.add(new Option(`${Math.round(selected)}°`, selected));
+  sel.value = selected == null ? '' : String(selected);
+  return sel;
+}
+
+function renderPatrolStops() {
+  const p = currentPatrol();
+  const list = document.getElementById('patrol-stops');
+  list.innerHTML = '';
+  document.getElementById('patrol-stops-empty').hidden = p.stops.length > 0;
+  p.stops.forEach((stop, i) => {
+    const li = document.createElement('li');
+    li.innerHTML = `
+      <div class="stop-head">
+        <span class="stop-num">${i + 1}</span>
+        <span class="stop-wp"></span>
+        <button data-act="up" title="Move earlier">↑</button>
+        <button data-act="down" title="Move later">↓</button>
+        <button data-act="remove" class="delete" title="Remove stop">✕</button>
+      </div>
+      <div class="stop-fields">
+        <label>Face <span data-slot="heading"></span></label>
+        <label>Hold <input data-k="dwell" type="number" min="0" max="600" step="1" /> s</label>
+      </div>`;
+    li.querySelector('.stop-wp').textContent = waypointLabel(stop.waypoint_id);
+    const hs = headingSelect(stop.heading_deg);
+    hs.addEventListener('change', () => {
+      stop.heading_deg = hs.value === '' ? null : Number(hs.value);
+      patrolEdited();
+    });
+    li.querySelector('[data-slot="heading"]').replaceWith(hs);
+    const dwell = li.querySelector('[data-k="dwell"]');
+    dwell.value = stop.dwell_s;
+    dwell.addEventListener('change', () => {
+      stop.dwell_s = Math.min(600, Math.max(0, parseFloat(dwell.value) || 0));
+      dwell.value = stop.dwell_s;
+      patrolEdited();
+    });
+    li.querySelector('[data-act="up"]').disabled = i === 0;
+    li.querySelector('[data-act="down"]').disabled = i === p.stops.length - 1;
+    li.querySelectorAll('[data-act]').forEach(b => b.addEventListener('click', () => {
+      if (b.dataset.act === 'remove') {
+        p.stops.splice(i, 1);
+      } else {
+        const j = b.dataset.act === 'up' ? i - 1 : i + 1;
+        [p.stops[i], p.stops[j]] = [p.stops[j], p.stops[i]];
+      }
+      renderPatrolStops();
+      patrolEdited();
+    }));
+    list.appendChild(li);
+  });
+  refreshPatrolOverlay();
+  updatePatrolUI();
+  state.map2d?.draw();
+}
+
+function patrolEdited() {
+  setStatus('Patrol updated (unsaved)');
+  refreshPatrolOverlay();
+  state.map2d?.draw();
+}
+
+function addPatrolStop(waypointId, headingDeg = null) {
+  currentPatrol().stops.push({ waypoint_id: waypointId, heading_deg: headingDeg, dwell_s: DEFAULT_DWELL_S });
+  renderPatrolStops();
+  patrolEdited();
+}
+
+// Show the selected patrol on the map while its tab is open, or while it's
+// the one running (with the current stop highlighted).
+function refreshPatrolOverlay() {
+  const p = currentPatrol();
+  const ns = state.live.navStatus;
+  const run = state.live.enabled && ns?.state === 'patrolling' && ns.patrol?.name === p?.name
+    ? ns.patrol : null;
+  const tabOpen = document.getElementById('panel-patrol').classList.contains('active');
+  state.patrolOverlay = p && (tabOpen || run)
+    ? { stops: p.stops, loop: p.loop, current: run ? run.index : null } : null;
+}
+
+function updatePatrolUI() {
+  const live = state.live.available;
+  document.getElementById('patrol-run').hidden = !live;
+  document.getElementById('patrol-stop').hidden = !live;
+  document.getElementById('patrol-add-here').hidden = !live;
+  const p = currentPatrol();
+  if (!p) return;
+  document.getElementById('patrol-run').disabled = !p.stops.length;
+  document.getElementById('patrol-add-here').disabled = !(state.live.enabled && lookTargetId());
+  const ns = state.live.navStatus, run = ns?.patrol;
+  const mine = run && run.name === p.name && ns.state === 'patrolling';
+  document.querySelectorAll('#patrol-stops li').forEach((li, i) =>
+    li.classList.toggle('current', !!mine && run.index === i));
+  const el = document.getElementById('patrol-status');
+  if (!run) { el.textContent = ''; return; }
+  const where = `"${run.name}" stop ${run.index + 1}/${run.total}${run.loop ? `, lap ${run.lap}` : ''}`;
+  const doing = run.phase === 'dwelling' ? `holding ${run.dwell_s}s at ${waypointLabel(ns.destination)}`
+    : `going to ${waypointLabel(ns.destination)}`
+      + (ns.heading_deg != null ? `, to face ${Math.round(ns.heading_deg)}°` : '');
+  el.textContent = ns.state === 'patrolling' ? `Running ${where}: ${doing}`
+    : ns.state === 'reached' ? `Finished "${run.name}".`
+    : ns.state === 'canceled' ? `Stopped at ${where}.`
+    : `Failed at ${where}: ${ns.state}${ns.error ? ` (${ns.error})` : ''}`;
+}
+
+document.getElementById('patrol-select').addEventListener('change', e => {
+  state.patrolIdx = Number(e.target.value);
+  renderPatrols();
+  state.map2d?.draw();
+});
+document.getElementById('patrol-new').addEventListener('click', () => {
+  const patrols = state.annotations.patrols;
+  patrols.push({ name: `patrol-${patrols.length + 1}`, stops: [], loop: false });
+  state.patrolIdx = patrols.length - 1;
+  renderPatrols();
+  setPatrolAddMode(true);
+  setStatus('New patrol: click waypoints on the map to add stops.');
+});
+document.getElementById('patrol-name').addEventListener('change', e => {
+  const p = currentPatrol();
+  p.name = e.target.value.trim() || p.name;
+  renderPatrols();
+  patrolEdited();
+});
+document.getElementById('patrol-loop').addEventListener('change', e => {
+  currentPatrol().loop = e.target.checked;
+  patrolEdited();
+});
+document.getElementById('patrol-add-mode').addEventListener('change', e => {
+  setPatrolAddMode(e.target.checked);
+  setStatus(e.target.checked ? 'Click waypoints on the map to add stops.' : '');
+});
+document.getElementById('patrol-add-here').addEventListener('click', () => {
+  const id = lookTargetId();
+  if (!id) return;
+  // Prefer the heading Spot was told to face here; otherwise snap its actual
+  // heading to the nearest dial step.
+  const ns = state.live.navStatus, pose = state.live.pose;
+  let h = ns?.destination === id ? ns.heading_deg : null;
+  if (h == null && pose?.localized) {
+    h = ((Math.round(pose.yaw * 180 / Math.PI / HEADING_STEP_DEG) * HEADING_STEP_DEG) % 360 + 360) % 360;
+  }
+  addPatrolStop(id, h);
+});
+document.getElementById('patrol-delete').addEventListener('click', () => {
+  const p = currentPatrol();
+  if (!p || !confirm(`Delete patrol "${p.name}"?`)) return;
+  state.annotations.patrols.splice(state.patrolIdx, 1);
+  state.patrolIdx -= 1;   // renderPatrols clamps
+  renderPatrols();
+  patrolEdited();
+});
+document.getElementById('patrol-run').addEventListener('click', async () => {
+  const p = currentPatrol();
+  if (!p?.stops.length) return;
+  if (!state.live.enabled) document.getElementById('live-toggle').click();
+  if (state.live.uploadedGraph !== state.graphName) {
+    setStatus('Upload graph to robot first (Drive tab).');
+    return;
+  }
+  const loop = p.loop ? ', repeating until STOP' : '';
+  if (!confirm(`Run patrol "${p.name}" (${p.stops.length} stops${loop})?`)) return;
+  setPatrolAddMode(false);
+  const r = await api('/patrol', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(p),
+  });
+  const j = await r.json().catch(() => ({}));
+  const detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail ?? r.status);
+  setStatus(r.ok ? `Running patrol "${p.name}"` : `Patrol failed to start: ${detail}`);
+});
+document.getElementById('patrol-stop').addEventListener('click', async () => {
   const r = await fetch('/api/stop', { method: 'POST' });
   setStatus(r.ok ? 'STOP sent' : 'STOP failed');
 });

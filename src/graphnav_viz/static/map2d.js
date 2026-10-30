@@ -304,6 +304,108 @@ export class Map2D {
       }
     }
 
+    // Patrol: dashed line in stop order (straight segments; GraphNav still
+    // follows the recorded edges), an arrow per stop heading, and numbered
+    // badges. A waypoint visited twice gets one badge like "2,5".
+    const patrol = this.state.patrolOverlay;
+    if (patrol?.stops.length) {
+      const PURPLE = '#b794f4';
+      const byId = new Map(this.graph.waypoints.map(w => [w.id, w]));
+      const stops = patrol.stops
+        .map((st, i) => ({ ...st, i, wp: byId.get(st.waypoint_id) }))
+        .filter(st => st.wp);
+      ctx.save();
+      ctx.strokeStyle = ctx.fillStyle = PURPLE;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 5]);
+      ctx.beginPath();
+      stops.forEach((st, k) => {
+        const [x, y] = this.w2s(st.wp.x, st.wp.y);
+        if (k) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      });
+      if (patrol.loop && stops.length > 2) ctx.closePath();
+      ctx.stroke();
+      ctx.setLineDash([]);
+      for (const st of stops) {
+        if (st.heading_deg == null) continue;
+        const [x, y] = this.w2s(st.wp.x, st.wp.y);
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(-st.heading_deg * Math.PI / 180);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(24, 0);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(31, 0);
+        ctx.lineTo(23, 4.5);
+        ctx.lineTo(23, -4.5);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+      const badges = new Map();   // waypoint id -> stop indices
+      for (const st of stops) badges.set(st.waypoint_id, [...(badges.get(st.waypoint_id) || []), st.i]);
+      ctx.font = 'bold 11px ui-sans-serif, system-ui';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      for (const [id, idxs] of badges) {
+        const wp = byId.get(id);
+        const [x, y] = this.w2s(wp.x, wp.y);
+        const text = idxs.map(i => i + 1).join(',');
+        const w = Math.max(18, ctx.measureText(text).width + 10);
+        ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(x - w / 2, y - 9, w, 18, 9);
+        else ctx.rect(x - w / 2, y - 9, w, 18);
+        ctx.fillStyle = PURPLE;
+        ctx.fill();
+        if (idxs.includes(patrol.current)) {
+          ctx.strokeStyle = '#00e5ff';
+          ctx.lineWidth = 2.5;
+          ctx.stroke();
+        }
+        ctx.fillStyle = '#1a202c';
+        ctx.fillText(text, x, y + 0.5);
+      }
+      ctx.restore();
+    }
+
+    // Look-around: heading ticks around the waypoint Spot would turn at, and
+    // an arrow for the commanded heading (map frame, same convention as yaw).
+    const look = this.state.live?.enabled ? this.state.live.look : null;
+    const lookWp = look && this.graph.waypoints.find(w => w.id === look.waypointId);
+    if (lookWp) {
+      const [cx, cy] = this.w2s(lookWp.x, lookWp.y);
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.strokeStyle = 'rgba(246, 173, 85, 0.55)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(0, 0, 22, 0, Math.PI * 2);
+      for (let h = 0; h < 360; h += look.stepDeg) {
+        const a = h * Math.PI / 180;
+        ctx.moveTo(22 * Math.cos(a), -22 * Math.sin(a));
+        ctx.lineTo(28 * Math.cos(a), -28 * Math.sin(a));
+      }
+      ctx.stroke();
+      if (look.headingDeg != null) {
+        ctx.rotate(-look.headingDeg * Math.PI / 180);
+        ctx.strokeStyle = ctx.fillStyle = '#f6ad55';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(36, 0);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(44, 0);
+        ctx.lineTo(34, 5);
+        ctx.lineTo(34, -5);
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
     // Live robot pose (drawn on top of everything else).
     const pose = this.state.live?.pose;
     if (this.state.live?.enabled && pose) {

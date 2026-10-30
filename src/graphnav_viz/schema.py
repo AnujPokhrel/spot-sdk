@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -48,8 +49,33 @@ class NoGoZone(BaseModel):
     polygon_seed: list[tuple[float, float]]
 
 
+class PatrolStop(BaseModel):
+    waypoint_id: str
+    # Map-frame heading to face on arrival (0 = +x, CCW positive), or None to
+    # keep the waypoint's recorded orientation.
+    heading_deg: float | None = None
+    dwell_s: float = Field(default=5.0, ge=0, le=600)
+
+    @field_validator('heading_deg')
+    @classmethod
+    def _normalize_heading(cls, v: float | None) -> float | None:
+        if v is None:
+            return None
+        if not math.isfinite(v):
+            raise ValueError('heading_deg must be a finite number')
+        return v % 360.0
+
+
+class Patrol(BaseModel):
+    """An ordered list of stops the robot visits in sequence."""
+    name: str
+    stops: list[PatrolStop] = Field(default_factory=list)
+    loop: bool = False   # start over from the first stop until stopped
+
+
 class Annotations(BaseModel):
     doors: list[DoorAnnotation] = Field(default_factory=list)
     waypoint_pois: dict[str, WaypointPOI] = Field(default_factory=dict)
     rooms: list[Polygon] = Field(default_factory=list)
     no_go_zones: list[NoGoZone] = Field(default_factory=list)
+    patrols: list[Patrol] = Field(default_factory=list)

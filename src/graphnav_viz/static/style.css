@@ -16,7 +16,7 @@ main { flex: 1; display: flex; min-height: 0; }
 
 #sidebar { width: 360px; border-left: 1px solid #333; background: #232830; display: flex; flex-direction: column; min-height: 0; }
 #tabs { display: flex; border-bottom: 1px solid #333; }
-.tab { flex: 1; padding: 0.6rem; background: transparent; color: #a0aec0; border: 0; border-bottom: 2px solid transparent; cursor: pointer; }
+.tab { flex: 1; padding: 0.6rem 0.2rem; font-size: 12px; background: transparent; color: #a0aec0; border: 0; border-bottom: 2px solid transparent; cursor: pointer; }
 .tab.active { color: white; border-bottom-color: #2c5282; }
 .panel { display: none; padding: 1rem; overflow-y: auto; flex: 1; }
 .panel.active { display: block; }
@@ -51,3 +51,52 @@ form button { margin-top: 0.4rem; padding: 0.4rem 0.8rem; background: #2c5282; c
 #estop-badge { font-family: ui-monospace, monospace; font-size: 12px; }
 #camera-source { width: 100%; margin-top: 0.3rem; }
 #camera-view { width: 100%; margin-top: 0.6rem; background: #000; border-radius: 4px; display: block; aspect-ratio: 4 / 3; object-fit: contain; }
+#panel-drive button:disabled { background: #4a5568; color: #a0aec0; cursor: default; }
+#look-target { line-height: 1.5; white-space: pre-line; }
+#look-dial { width: 220px; height: 220px; display: block; margin: 0.4rem auto 0.2rem; user-select: none; }
+#look-dial .ring { fill: none; stroke: #333; stroke-width: 2; }
+#look-dial .heading { cursor: pointer; }
+#look-dial .heading circle { fill: #2c5282; stroke: #1a1d23; stroke-width: 2; }
+#look-dial .heading:hover circle { fill: #2b6cb0; }
+#look-dial .heading text { fill: white; font-size: 10px; text-anchor: middle; dominant-baseline: central; pointer-events: none; }
+#look-dial .heading.active circle { fill: #f6ad55; }
+#look-dial .heading.active text { fill: #1a202c; }
+#look-dial .heading.reached circle { fill: #2f855a; }
+#look-dial.disabled .heading { cursor: default; pointer-events: none; }
+#look-dial.disabled .heading circle { fill: #4a5568; }
+#look-dial.disabled .heading text { fill: #a0aec0; }
+#look-needle line { stroke: #00e5ff; stroke-width: 3; stroke-linecap: round; }
+#look-needle polygon, #look-dial .hub { fill: #00e5ff; }
+#look-dwell { width: 4rem; background: #1a1d23; border: 1px solid #333; color: #e6e6e6; padding: 0.3rem; border-radius: 3px; font-size: 13px; }
+#estop-block { position: sticky; bottom: -1rem; margin: 0 -1rem -1rem; padding: 0 1rem 0.6rem; background: #232830; }
+#panel-patrol .row { display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; margin-bottom: 0.6rem; }
+#patrol-editor > label { display: block; margin-bottom: 0.6rem; font-size: 12px; color: #a0aec0; }
+#panel-patrol select, #panel-patrol input:not([type=checkbox]) { background: #1a1d23; border: 1px solid #333; color: #e6e6e6; padding: 0.3rem 0.4rem; border-radius: 3px; font-size: 13px; }
+#patrol-select { flex: 1; min-width: 0; }
+#patrol-name { width: 100%; margin-top: 0.2rem; }
+#panel-patrol button { background: #2c5282; color: white; border: 0; padding: 0.4rem 0.8rem; border-radius: 3px; cursor: pointer; }
+#panel-patrol button:hover { background: #2b6cb0; }
+#panel-patrol button:disabled { background: #4a5568; color: #a0aec0; cursor: default; }
+#panel-patrol button.delete { background: #742a2a; }
+#panel-patrol button.delete:hover { background: #9b2c2c; }
+#patrol-run { flex: 1; }
+#patrol-stops { list-style: none; padding: 0; margin: 0 0 0.6rem; }
+#patrol-stops li { background: #1a1d23; border: 1px solid #333; border-radius: 4px; padding: 0.4rem 0.5rem; margin-bottom: 0.4rem; }
+#patrol-stops li.current { border-color: #00e5ff; }
+#patrol-stops .stop-head { display: flex; align-items: center; gap: 0.3rem; }
+#patrol-stops .stop-num { background: #b794f4; color: #1a202c; font-weight: bold; font-size: 11px; border-radius: 9px; min-width: 18px; padding: 1px 5px; text-align: center; }
+#patrol-stops .stop-wp { flex: 1; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#patrol-stops .stop-head button { padding: 0.15rem 0.45rem; font-size: 12px; }
+#patrol-stops .stop-fields { display: flex; gap: 0.8rem; align-items: center; margin-top: 0.35rem; font-size: 12px; color: #a0aec0; }
+#patrol-stops .stop-fields input { width: 3.5rem; }
+#patrol-status { margin: 0.2rem 0 0.6rem; line-height: 1.5; }
+#look-tilt { min-width: 4.5rem; }
+/* Pinned to the top of the Drive panel (the e-stop is pinned to the bottom); the outline
+   in the panel colour masks controls scrolling past behind it. */
+#nav-banner { position: sticky; top: -0.5rem; z-index: 2; outline: 0.5rem solid #232830; border-radius: 6px; padding: 0.7rem 0.8rem; margin-bottom: 0.8rem; text-align: center; }
+#nav-banner-label { font-size: 22px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }
+#nav-banner-detail { font-size: 12px; margin-top: 0.25rem; line-height: 1.4; overflow-wrap: anywhere; }
+#nav-banner.idle { background: #2d3748; color: #a0aec0; }
+#nav-banner.progress { background: #d69e2e; color: #1a202c; }
+#nav-banner.arrived { background: #2f855a; color: #fff; }
+#nav-banner.unable { background: #c53030; color: #fff; }
