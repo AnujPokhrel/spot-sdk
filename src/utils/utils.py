@@ -32,7 +32,8 @@ def connect(hostname: str, client_name: str = 'SpotApp'):
     sdk = create_standard_sdk(client_name)
     robot = sdk.create_robot(hostname)
     authenticate(robot)
-    robot.time_sync.wait_for_sync()
+    # The SDK default (3 s) times out on a jittery WiFi link.
+    robot.time_sync.wait_for_sync(timeout_sec=15.0)
     return robot
 
 

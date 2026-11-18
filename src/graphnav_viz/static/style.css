@@ -5,7 +5,6 @@ header label { font-size: 12px; color: #a0aec0; display: flex; align-items: cent
 header select { background: #1a1d23; color: #e6e6e6; border: 1px solid #333; padding: 0.3rem 0.4rem; border-radius: 3px; font-size: 12px; }
 header button { background: #2c5282; color: white; border: 0; padding: 0.4rem 0.8rem; border-radius: 4px; cursor: pointer; }
 header button:hover { background: #2b6cb0; }
-header button.active { background: #f6ad55; color: #1a202c; }
 header button:disabled { background: #4a5568; color: #a0aec0; cursor: default; }
 #graph-info { font-family: ui-monospace, monospace; font-size: 12px; color: #a0aec0; }
 #status { margin-left: auto; font-size: 12px; color: #68d391; }
@@ -23,22 +22,11 @@ main { flex: 1; display: flex; min-height: 0; }
 .panel h2 { margin: 0 0 0.75rem; font-size: 14px; text-transform: uppercase; color: #a0aec0; letter-spacing: 0.05em; }
 .muted { color: #718096; font-size: 13px; }
 
-form label { display: block; margin-bottom: 0.6rem; font-size: 12px; color: #a0aec0; }
-form input, form textarea, form select { width: 100%; background: #1a1d23; border: 1px solid #333; color: #e6e6e6; padding: 0.4rem; border-radius: 3px; font-size: 13px; }
-form button { margin-top: 0.4rem; padding: 0.4rem 0.8rem; background: #2c5282; color: white; border: 0; border-radius: 3px; cursor: pointer; }
-
-.card { background: #1a1d23; border: 1px solid #333; border-radius: 4px; padding: 0.6rem; margin-bottom: 0.6rem; }
-.card h3 { margin: 0 0 0.4rem; font-size: 13px; color: #fff; }
-.card .row { display: flex; gap: 0.4rem; }
-.card .row label { flex: 1; }
-.card .delete { background: #742a2a; }
-.card .delete:hover { background: #9b2c2c; }
-.card.focus { outline: 2px solid #f6e05e; }
 #live-badge { font-family: ui-monospace, monospace; font-size: 12px; color: #a0aec0; }
-#panel-drive .row { display: flex; gap: 0.4rem; flex-wrap: wrap; }
-#panel-drive button { background: #2c5282; color: white; border: 0; padding: 0.4rem 0.8rem; border-radius: 3px; cursor: pointer; }
-#panel-drive button.delete { background: #742a2a; padding: 0.6rem 1rem; font-weight: bold; width: 100%; }
-#panel-drive button.delete:hover { background: #9b2c2c; }
+#panel-drive .row, #panel-move .row { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+#panel-drive button, #panel-move button, #estop-block button { background: #2c5282; color: white; border: 0; padding: 0.4rem 0.8rem; border-radius: 3px; cursor: pointer; }
+#panel-drive button.delete, #panel-move button.delete { background: #742a2a; padding: 0.6rem 1rem; font-weight: bold; width: 100%; }
+#panel-drive button.delete:hover, #panel-move button.delete:hover { background: #9b2c2c; }
 #drive-status { margin-bottom: 0.8rem; line-height: 1.5; }
 .estop-soft { background: #c05621 !important; color: white; padding: 0.6rem 1rem !important; font-weight: bold; }
 .estop-soft:hover { background: #dd6b20 !important; }
@@ -49,9 +37,16 @@ form button { margin-top: 0.4rem; padding: 0.4rem 0.8rem; background: #2c5282; c
 .estop-allow:disabled { background: #4a5568 !important; cursor: default; }
 #estop-status { font-family: ui-monospace, monospace; font-size: 12px; padding: 0.4rem; border-radius: 3px; background: #1a1d23; }
 #estop-badge { font-family: ui-monospace, monospace; font-size: 12px; }
-#camera-source { width: 100%; margin-top: 0.3rem; }
-#camera-view { width: 100%; margin-top: 0.6rem; background: #000; border-radius: 4px; display: block; aspect-ratio: 4 / 3; object-fit: contain; }
-#panel-drive button:disabled { background: #4a5568; color: #a0aec0; cursor: default; }
+#camera-source { width: 100%; margin-top: 0.5rem; background: #1a1d23; color: #e6e6e6; border: 1px solid #333; padding: 0.3rem 0.4rem; border-radius: 3px; font-size: 12px; }
+#camera-view { width: 100%; min-height: 120px; margin-top: 0.5rem; background: #000; border-radius: 4px; display: block; }
+#panel-drive button:disabled, #panel-move button:disabled { background: #4a5568; color: #a0aec0; cursor: default; }
+#move-pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.4rem; margin: 0.8rem 0; }
+#move-pad button { padding: 1rem 0.2rem; font-size: 13px; }
+#move-pad button.delete { padding: 1rem 0.2rem; }
+#move-status { min-height: 1.2em; line-height: 1.5; overflow-wrap: anywhere; }
+#lease-row { display: flex; gap: 0.5rem; align-items: center; justify-content: space-between; margin-bottom: 0.6rem; }
+#lease-status { min-width: 0; overflow-wrap: anywhere; }
+#lease-hijack { flex: none; }
 #look-target { line-height: 1.5; white-space: pre-line; }
 #look-dial { width: 220px; height: 220px; display: block; margin: 0.4rem auto 0.2rem; user-select: none; }
 #look-dial .ring { fill: none; stroke: #333; stroke-width: 2; }
@@ -68,7 +63,8 @@ form button { margin-top: 0.4rem; padding: 0.4rem 0.8rem; background: #2c5282; c
 #look-needle line { stroke: #00e5ff; stroke-width: 3; stroke-linecap: round; }
 #look-needle polygon, #look-dial .hub { fill: #00e5ff; }
 #look-dwell { width: 4rem; background: #1a1d23; border: 1px solid #333; color: #e6e6e6; padding: 0.3rem; border-radius: 3px; font-size: 13px; }
-#estop-block { position: sticky; bottom: -1rem; margin: 0 -1rem -1rem; padding: 0 1rem 0.6rem; background: #232830; }
+#estop-block { flex: none; padding: 0 1rem 0.6rem; background: #232830; }
+#estop-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem; margin-top: 0.5rem; }
 #panel-patrol .row { display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; margin-bottom: 0.6rem; }
 #patrol-editor > label { display: block; margin-bottom: 0.6rem; font-size: 12px; color: #a0aec0; }
 #panel-patrol select, #panel-patrol input:not([type=checkbox]) { background: #1a1d23; border: 1px solid #333; color: #e6e6e6; padding: 0.3rem 0.4rem; border-radius: 3px; font-size: 13px; }
@@ -91,8 +87,8 @@ form button { margin-top: 0.4rem; padding: 0.4rem 0.8rem; background: #2c5282; c
 #patrol-stops .stop-fields input { width: 3.5rem; }
 #patrol-status { margin: 0.2rem 0 0.6rem; line-height: 1.5; }
 #look-tilt { min-width: 4.5rem; }
-/* Pinned to the top of the Drive panel (the e-stop is pinned to the bottom); the outline
-   in the panel colour masks controls scrolling past behind it. */
+/* Pinned to the top of the Drive panel; the outline in the panel colour masks controls
+   scrolling past behind it. */
 #nav-banner { position: sticky; top: -0.5rem; z-index: 2; outline: 0.5rem solid #232830; border-radius: 6px; padding: 0.7rem 0.8rem; margin-bottom: 0.8rem; text-align: center; }
 #nav-banner-label { font-size: 22px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }
 #nav-banner-detail { font-size: 12px; margin-top: 0.25rem; line-height: 1.4; overflow-wrap: anywhere; }

@@ -19,6 +19,11 @@ with metadata that downstream tasks consume:
 Annotations live in a sidecar `annotations.json` next to the graph; the
 recorded graph itself is never modified.
 
+> The UI's editors for waypoints, doors, rooms and no-go zones were removed on
+> 2026-11-02, along with "Schematic", "Save annotations" and "Export doors.yaml".
+> Existing annotations are kept and still drawn on the map, and the annotations and
+> `export/doors` API endpoints still work. Patrols are the only thing edited in the UI.
+
 ## Install
 
 ```bash
@@ -153,7 +158,7 @@ See `loader.fiducial_category` for the source of truth.
 | GET | `/api/live` | `{enabled, hostname, uploaded_graph}` — used by the UI to show/hide the Drive controls. |
 | GET | `/api/pose` | `{x, y, z, yaw, waypoint_id, localized, uploaded_graph}` — `seed_tform_body` from `GraphNavClient.get_localization_state`. |
 | GET | `/api/robot_state` | `{powered_on, estopped, estop_endpoints}`. |
-| GET | `/api/nav_status` | Current `{state, destination, heading_deg, sweep, patrol, tilt_deg, error?}` from the background nav worker. `state` is `idle`, `navigating` / `sweeping` / `patrolling` (in progress), `reached`, or a failure (`stuck`, `lost`, `no_route`, `no_localization`, `overridden`, `canceled`, `error`). `heading_deg` is the commanded map-frame heading (`null` = the waypoint's recorded orientation). `sweep` is `null` or `{index, total, phase: 'turning' \| 'dwelling' \| 'done', dwell_s}`. `patrol` is `null` or `{name, index, total, lap, loop, phase: 'driving' \| 'dwelling' \| 'done', dwell_s}`. `tilt_deg` is the last commanded body pitch. |
+| GET | `/api/nav_status` | Current `{state, destination, heading_deg, sweep, patrol, goal, tilt_deg, error?}` from the background nav worker. `state` is `idle`, `navigating` / `sweeping` / `patrolling` (in progress), `reached`, or a failure (`stuck`, `lost`, `no_route`, `no_localization`, `overridden`, `canceled`, `error`). `heading_deg` is the commanded map-frame heading (`null` = the waypoint's recorded orientation). `sweep` is `null` or `{index, total, phase: 'turning' \| 'dwelling' \| 'done', dwell_s}`. `patrol` is `null` or `{name, index, total, lap, loop, phase: 'driving' \| 'dwelling' \| 'done', dwell_s}`. `goal` is `null` or `{x, y, z, near}` for a go-to-point command, which has `destination: null`. `tilt_deg` is the last commanded body pitch. |
 | POST | `/api/power_on` | Powers on the robot's motors. |
 | POST | `/api/stand` | Blocking stand (`blocking_stand`) — brings Spot to standing height, e.g. to see fiducials mounted above sitting-camera height. |
 | POST | `/api/sit` | Cancels any nav/sweep/patrol (otherwise its next `navigate_to` would stand Spot back up), then `blocking_sit`. |
@@ -166,9 +171,13 @@ See `loader.fiducial_category` for the source of truth.
 | POST | `/api/graphs/{name}/upload` | Streams `graph` + missing waypoint/edge snapshots to the robot. |
 | POST | `/api/graphs/{name}/localize` | `set_localization` with `FIDUCIAL_INIT_NEAREST`. |
 | POST | `/api/graphs/{name}/navigate/{waypoint_id}` | Starts (or replaces) a background worker that drives Spot to the waypoint. Optional `?heading_deg=` (map frame, 0 = +x, CCW positive) makes it finish on the waypoint facing that heading. If Spot is already there, it just turns in place. See [Look around](#look-around). |
+| POST | `/api/graphs/{name}/navigate_point?x=&y=` | Same, to any map-frame point within 5 m (`MAX_GOAL_DISTANCE_M`) of a waypoint on Spot's current floor; farther points get a 409. Spot follows the graph to a nearby waypoint, then walks straight to the point avoiding obstacles. Optional `&heading_deg=` sets the final heading; without it, the heading is left free. |
 | POST | `/api/graphs/{name}/patrol` | Run a patrol. JSON body is a `Patrol` (`{name, loop, stops: [{waypoint_id, heading_deg, dwell_s}]}`, same shape as in `annotations.json`). Drives to each stop in order, faces its heading (`null` = recorded orientation), holds `dwell_s`. With `loop`, it starts over until `/api/stop`. A failing stop ends the patrol and is reported in `nav_status`; there's no re-planning. |
 | POST | `/api/graphs/{name}/sweep/{waypoint_id}` | Look-around sweep: faces every `step_deg` heading (default 30) in turn at the waypoint, holding `dwell_s` (default 3) at each. Starts at the step nearest Spot's current heading and goes counter-clockwise. Returns `{headings_deg}`. Replaced by any new navigate/sweep, canceled by `/api/stop`. |
-| GET | `/api/cameras` | `[{name, image_type: 'visual' \| 'depth' \| 'unknown', cols, rows}]` from `ImageClient.list_image_sources`. |
+| POST | `/api/move/{direction}` | Walk for 0.5 s, then stop by itself. `forward`, `backward`, `left`, `right`, `turn_left`, `turn_right`. No map or localization needed. 409 during a route. |
+| GET | `/api/lease` | `{ours, holder, stale}`: who Spot says holds the body lease. |
+| POST | `/api/lease/hijack` | Forcibly take the body lease from whoever holds it. |
+| GET | `/api/cameras` | `[{name, image_type: 'visual' \| 'depth' \| 'unknown', cols, rows}]` from `ImageClient.list_image_sources`, plus `front_combined` when both front cameras exist. |
 | GET | `/api/camera/{source}` | Single JPEG snapshot from an image source. |
 | GET | `/api/camera_stream/{source}` | MJPEG stream (`multipart/x-mixed-replace`) — an `<img>` tag can point straight at this. Pulls a fresh JPEG from the robot on every frame (default 8 fps, `?fps=` to override up to 15); no server-side buffering, so the stream stops as soon as the client disconnects. |
 
@@ -178,8 +187,7 @@ See `loader.fiducial_category` for the source of truth.
 |---|---|
 | ![2D with scans](assets/2D_graphnav_withscan.png) | ![3D with scans](assets/3D_graphnav_withscan.png) |
 
-- **Top bar** — graph dropdown, view toggle, "Show scans", "Save annotations",
-  "Export doors.yaml".
+- **Top bar** — graph dropdown, view toggle, "Show scans".
 - **2D map (default)** — pan with drag, zoom with scroll. Edges as gray lines,
   waypoints as filled circles (blue if POI'd), fiducials as colored squares
   with `#id category` labels. Doors get a yellow ring.
@@ -190,30 +198,27 @@ See `loader.fiducial_category` for the source of truth.
 - **3D view** — three.js scene with the same primitives plus a floor grid.
   Click a waypoint to lazy-load its individual snapshot point cloud.
 - **Sidebar tabs**:
-  - *Waypoint*: rename / tag / notes the selected waypoint.
-  - *Doors*: grouped by fiducial category. Localization tags get a "Mark as
-    door" button; once marked, the full edit form appears.
-  - *Rooms*: "+ New room" → click vertices on the map → double-click to
-    close → name it. Waypoint membership auto-fills via point-in-polygon.
-  - *No-go*: same polygon flow.
   - *Patrol*: build named patrols (ordered stops: waypoint, heading to
     face, hold time) by clicking waypoints on the map or "+ Add where Spot
     is now", reorder with ↑/↓, optionally "Repeat until stopped", then
     "▶ Run patrol" (live only). The selected patrol is drawn on the 2D map:
     numbered purple badges, dashed line in stop order, heading arrows, and
-    a cyan ring on the stop in progress. Saved in `annotations.json` with
-    "Save annotations", like rooms and doors.
+    a cyan ring on the stop in progress. "Save patrols" writes them to
+    `annotations.json`.
   - *Drive* (only with `--live`): a big navigation status banner pinned at
     the top (**In progress** / **Arrived** / **Unable to complete** with the
-    reason, or **Idle**), power-on, stand, sit, upload graph to robot,
-    localize via nearest fiducial, toggle "click waypoint to navigate", a
-    big red **STOP** button, the **Look around** heading dial + 360° sweep +
-    tilt up/down, and the software e-stop (pinned to the bottom of the panel
-    so it never scrolls out of view).
-  - *Cameras* (only with `--live`): pick a body camera and view its live
-    MJPEG feed. Streaming stops automatically when you leave the tab, turn
-    Live off, or navigate away — it only runs while you're actually looking
-    at it.
+    reason, or **Idle**), an optional live camera (off until ticked; it only
+    streams while ticked and on this tab, as Spot's JPEGs undecoded, and
+    `front_combined` merges the two front cameras), power-on, stand, sit, upload graph to robot,
+    localize via nearest fiducial, toggles for "click waypoint to navigate"
+    and "click map to go to any point" (2D map only; drag sets the heading,
+    middle-drag pans), a big red **STOP** button, and the **Look around** heading
+    dial + 360° sweep + tilt up/down.
+  - *Move* (only with `--live`): power-on, stand, sit, buttons to walk forward,
+    back, sideways and turn, and STOP. Each press runs for 0.5 s and stops by
+    itself, and the buttons lock for that time. No map or localization needed.
+  - Below the tabs (only with `--live`): who holds the lease, **Hijack lease**, and
+    the software e-stop, on every tab.
 
 ## Live mode
 
@@ -250,6 +255,7 @@ yaw. The marker turns gray if the robot isn't localized to the loaded graph.
 5. Click "Localize (nearest fiducial)"  → /api/pose now returns localized:true
 6. Tick "Click waypoint to navigate"
 7. Click any waypoint on the 2D or 3D map → robot drives there
+   (or tick "Click map to go to any point" and click in the shaded area of the 2D map)
 8. Look around: click a heading on the dial (or "Sweep 360°") → robot turns on that waypoint;
    Tilt ▲/▼ pitches the body to look up/down without turning
 9. Or run a saved patrol from the Patrol tab

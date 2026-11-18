@@ -20,10 +20,7 @@
     </label>
     <span id="graph-info"></span>
     <button id="view-toggle">Switch to 3D</button>
-    <button id="schematic-toggle">Schematic</button>
     <button id="scans-toggle">Show scans</button>
-    <button id="save-btn">Save annotations</button>
-    <button id="export-doors-btn">Export doors.yaml</button>
     <button id="live-toggle" hidden>Live: off</button>
     <span id="live-badge" hidden></span>
     <span id="estop-badge" hidden></span>
@@ -38,40 +35,11 @@
 
     <aside id="sidebar">
       <nav id="tabs">
-        <button class="tab active" data-tab="waypoint">Waypoint</button>
-        <button class="tab" data-tab="doors">Doors</button>
-        <button class="tab" data-tab="rooms">Rooms</button>
-        <button class="tab" data-tab="nogo">No-go</button>
-        <button class="tab" data-tab="patrol">Patrol</button>
         <button class="tab" data-tab="drive" id="tab-drive" hidden>Drive</button>
-        <button class="tab" data-tab="cameras" id="tab-cameras" hidden>Cameras</button>
+        <button class="tab" data-tab="move" id="tab-move" hidden>Move</button>
+        <button class="tab active" data-tab="patrol">Patrol</button>
       </nav>
-      <section id="panel-waypoint" class="panel active">
-        <h2>Waypoint</h2>
-        <div id="wp-empty" class="muted">Click a waypoint on the map.</div>
-        <form id="wp-form" hidden>
-          <label>ID <input id="wp-id" readonly /></label>
-          <label>Name <input id="wp-name" /></label>
-          <label>Tags (comma-separated) <input id="wp-tags" /></label>
-          <label>Notes <textarea id="wp-notes" rows="3"></textarea></label>
-          <button type="button" id="wp-apply">Apply</button>
-        </form>
-      </section>
-      <section id="panel-doors" class="panel">
-        <h2>Doors</h2>
-        <div id="doors-list"></div>
-      </section>
-      <section id="panel-rooms" class="panel">
-        <h2>Rooms</h2>
-        <button id="room-new">+ New room</button>
-        <div id="rooms-list"></div>
-      </section>
-      <section id="panel-nogo" class="panel">
-        <h2>No-go zones</h2>
-        <button id="nogo-new">+ New no-go zone</button>
-        <div id="nogo-list"></div>
-      </section>
-      <section id="panel-patrol" class="panel">
+      <section id="panel-patrol" class="panel active">
         <h2>Patrol</h2>
         <div class="row">
           <select id="patrol-select" hidden></select>
@@ -92,7 +60,10 @@
             <button id="patrol-stop" class="delete" hidden>STOP</button>
           </div>
           <div id="patrol-status" class="muted"></div>
-          <div class="muted">Edits are kept until you click "Save annotations".</div>
+          <div class="row">
+            <button id="patrol-save">Save patrols</button>
+            <span class="muted">Edits stay on this page until saved.</span>
+          </div>
           <button id="patrol-delete" class="delete" style="margin-top:0.8rem;">Delete patrol</button>
         </div>
       </section>
@@ -102,7 +73,13 @@
           <div id="nav-banner-label">Idle</div>
           <div id="nav-banner-detail">Turn Live on to see navigation status.</div>
         </div>
-        <div id="drive-status" class="muted">Live mode is off.</div>
+        <label><input type="checkbox" id="camera-on" autocomplete="off" /> Show camera</label>
+        <div id="camera-controls" hidden>
+          <select id="camera-source"></select>
+          <img id="camera-view" alt="camera stream" />
+          <div id="camera-status" class="muted" style="margin-top:0.4rem;"></div>
+        </div>
+        <div id="drive-status" class="muted" style="margin-top:0.6rem;">Live mode is off.</div>
         <div class="row">
           <button id="drive-power-on">Power on</button>
           <button id="drive-stand" style="background: #2b6cb0;">Stand</button>
@@ -113,6 +90,10 @@
         <label style="margin-top:0.6rem; display:block;">
           <input type="checkbox" id="drive-mode" />
           Click waypoint to navigate (off → click selects)
+        </label>
+        <label style="margin-top:0.3rem; display:block;">
+          <input type="checkbox" id="drive-go-mode" />
+          Click map to go to any point in the shaded area (drag to set heading, middle-drag to pan)
         </label>
         <button id="drive-stop" class="delete" style="margin-top:0.8rem;">STOP (cancel nav)</button>
         <hr style="border:0; border-top:1px solid #333; margin:1rem 0;" />
@@ -131,28 +112,44 @@
           <button id="look-tilt-down" disabled title="Pitch the body down (feet and heading stay put)">▼ Down</button>
           <span id="look-tilt" class="muted">level</span>
         </div>
-        <!-- Sticky so the e-stop never scrolls out of view on short screens. -->
-        <div id="estop-block">
-          <hr style="border:0; border-top:1px solid #333; margin:1rem 0;" />
-          <h3 style="margin:0 0 0.5rem; font-size:12px; color:#a0aec0; text-transform:uppercase; letter-spacing:0.05em;">Software E-Stop</h3>
-          <div id="estop-status" class="muted">—</div>
-          <button id="estop-settle" class="estop-soft" style="margin-top:0.5rem; width:100%;">Settle-then-cut</button>
-          <button id="estop-cut" class="estop-hard" style="margin-top:0.4rem; width:100%;">Hard cut</button>
-          <button id="estop-allow" class="estop-allow" style="margin-top:0.4rem; width:100%;" disabled>Allow / re-arm</button>
-          <a id="estop-popout" href="#" style="display:inline-block; margin-top:0.6rem; font-size:12px; color:#63b3ed;">↗ Pop out e-stop</a>
-        </div>
       </section>
-      <section id="panel-cameras" class="panel">
-        <h2>Cameras</h2>
-        <div id="camera-empty" class="muted">Live mode required.</div>
-        <div id="camera-controls" hidden>
-          <label>Source
-            <select id="camera-source"></select>
-          </label>
-          <img id="camera-view" alt="camera stream" />
-          <div id="camera-status" class="muted" style="margin-top:0.4rem;"></div>
+      <section id="panel-move" class="panel">
+        <h2>Move</h2>
+        <div class="muted">Each press walks Spot for half a second, then it stops. No map or localization needed.</div>
+        <div class="row" style="margin-top:0.6rem;">
+          <button id="move-power-on">Power on</button>
+          <button id="move-stand" style="background: #2b6cb0;">Stand</button>
+          <button id="move-sit" style="background: #2b6cb0;">Sit</button>
         </div>
+        <div id="move-pad">
+          <button data-move="turn_left">↺ Turn left</button>
+          <button data-move="forward">▲ Forward</button>
+          <button data-move="turn_right">↻ Turn right</button>
+          <button data-move="left">◀ Left</button>
+          <button id="move-stop" class="delete">STOP</button>
+          <button data-move="right">▶ Right</button>
+          <span></span>
+          <button data-move="backward">▼ Back</button>
+          <span></span>
+        </div>
+        <div id="move-status" class="muted"></div>
       </section>
+      <!-- Outside the panels, so lease and e-stop stay on screen on every tab. -->
+      <div id="estop-block" hidden>
+        <hr style="border:0; border-top:1px solid #333; margin:0 0 0.6rem;" />
+        <div id="lease-row">
+          <span id="lease-status" class="muted">Lease: —</span>
+          <button id="lease-hijack">Hijack lease</button>
+        </div>
+        <h3 style="margin:0 0 0.5rem; font-size:12px; color:#a0aec0; text-transform:uppercase; letter-spacing:0.05em;">Software E-Stop</h3>
+        <div id="estop-status" class="muted">—</div>
+        <div id="estop-buttons">
+          <button id="estop-settle" class="estop-soft">Settle-then-cut</button>
+          <button id="estop-cut" class="estop-hard">Hard cut</button>
+          <button id="estop-allow" class="estop-allow" disabled>Allow / re-arm</button>
+          <a id="estop-popout" href="#" style="font-size:12px; color:#63b3ed; align-self:center; text-align:center;">↗ Pop out e-stop</a>
+        </div>
+      </div>
     </aside>
   </main>
 

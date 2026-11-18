@@ -26,13 +26,16 @@ export const FIDUCIAL_COLORS = {
   unknown:           '#a0aec0',  // gray
 };
 
+// In go mode, a press moved less than this is a plain click, not a heading drag.
+const GO_DRAG_MIN_PX = 10;
+
 export class Map2D {
   constructor(canvas, graph, state, callbacks) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
     this.graph = graph;
     this.state = state;        // shared annotations + selection
-    this.cb = callbacks;       // { onSelectWaypoint, onSelectFiducial, onPolygonClosed }
+    this.cb = callbacks;       // { onSelectWaypoint, onSelectFiducial, goMode, onGoToPoint }
 
     // World-frame center to canvas. Initial fit:
     const b = graph.bounds;
@@ -40,23 +43,26 @@ export class Map2D {
     this._fit();
 
     this.dragLast = null;
-    this.polygonMode = null;     // null | { type: 'room' | 'nogo', vertices: [] }
+    this.goDrag = null;          // go mode: { wx, wy, sx, sy, cx, cy } from press to release
     this.scans = null;           // Float32Array (3N) in seed frame
 
     this._handlers = {
       down: e => this._onDown(e),
       move: e => this._onMove(e),
-      up: () => (this.dragLast = null),
+      up: () => this._onUp(),
       wheel: e => this._onWheel(e),
-      dblclick: e => this._onDblClick(e),
       resize: () => { this._resize(); this.draw(); },
     };
     canvas.addEventListener('mousedown', this._handlers.down);
     canvas.addEventListener('mousemove', this._handlers.move);
     window.addEventListener('mouseup', this._handlers.up);
     canvas.addEventListener('wheel', this._handlers.wheel, { passive: false });
-    canvas.addEventListener('dblclick', this._handlers.dblclick);
     window.addEventListener('resize', this._handlers.resize);
+    // The canvas also changes size without the window doing so (Live on adds a row to
+    // the layout). A stale buffer gets scaled to fit, drawing things away from where
+    // clicks land.
+    this._resizeObserver = new ResizeObserver(this._handlers.resize);
+    this._resizeObserver.observe(canvas);
     this._resize();
   }
 
@@ -66,8 +72,8 @@ export class Map2D {
     this.canvas.removeEventListener('mousemove', this._handlers.move);
     window.removeEventListener('mouseup', this._handlers.up);
     this.canvas.removeEventListener('wheel', this._handlers.wheel);
-    this.canvas.removeEventListener('dblclick', this._handlers.dblclick);
     window.removeEventListener('resize', this._handlers.resize);
+    this._resizeObserver.disconnect();
     this._handlers = null;
     this.graph = null;
     this.scans = null;
@@ -151,30 +157,23 @@ export class Map2D {
     this._scanBounds = { minX, maxY, W, H, ppm };
   }
 
-  startPolygon(type) {
-    this.polygonMode = { type, vertices: [] };
-    this.draw();
-  }
-  cancelPolygon() {
-    this.polygonMode = null;
-    this.draw();
-  }
-
   _onDown(e) {
     const rect = this.canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
 
-    if (this.polygonMode) {
-      const [wx, wy] = this.s2w(sx, sy);
-      this.polygonMode.vertices.push([wx, wy]);
-      this.draw();
+    if (this.cb.goMode?.()) {
+      if (e.button === 0) {
+        const [wx, wy] = this.s2w(sx, sy);
+        this.goDrag = { wx, wy, sx, sy, cx: sx, cy: sy };
+        this.draw();
+      } else if (e.button === 1) {   // left-drag sets the heading in this mode
+        e.preventDefault();
+        this.dragLast = { sx, sy };
+      }
       return;
     }
 
     if (e.button === 0) {
-      // In schematic mode, waypoints/fiducials are hidden, so skip hit-test
-      // and fall through to pan.
-      if (this.state.schematic) { this.dragLast = { sx, sy }; return; }
       // Hit-test waypoints (radius 8 px) and fiducials (10 px)
       for (const f of this.graph.fiducials) {
         const [fx, fy] = this.w2s(f.x, f.y);
@@ -193,10 +192,31 @@ export class Map2D {
       this.dragLast = { sx, sy };
     }
   }
+  _goHeadingDeg() {
+    const d = this.goDrag;
+    if (Math.hypot(d.cx - d.sx, d.cy - d.sy) < GO_DRAG_MIN_PX) return null;
+    // Canvas Y is flipped vs. world Y.
+    return Math.atan2(d.sy - d.cy, d.cx - d.sx) * 180 / Math.PI;
+  }
+  _onUp() {
+    this.dragLast = null;
+    if (!this.goDrag) return;
+    const { wx, wy } = this.goDrag;
+    const heading = this._goHeadingDeg();
+    this.goDrag = null;
+    this.draw();
+    this.cb.onGoToPoint?.(wx, wy, heading);
+  }
   _onMove(e) {
-    if (!this.dragLast) return;
+    if (!this.dragLast && !this.goDrag) return;
     const rect = this.canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+    if (this.goDrag) {
+      this.goDrag.cx = sx;
+      this.goDrag.cy = sy;
+      this.draw();
+      return;
+    }
     this.center.x -= (sx - this.dragLast.sx) / this.scale;
     this.center.y += (sy - this.dragLast.sy) / this.scale;
     this.dragLast = { sx, sy };
@@ -213,26 +233,15 @@ export class Map2D {
     this.center.y += wyBefore - wyAfter;
     this.draw();
   }
-  _onDblClick(e) {
-    if (this.polygonMode && this.polygonMode.vertices.length >= 3) {
-      const closed = this.polygonMode;
-      this.polygonMode = null;
-      this.cb.onPolygonClosed?.(closed.type, closed.vertices);
-      this.draw();
-    }
-  }
-
   draw() {
     const ctx = this.ctx;
     const w = this.canvas.clientWidth, h = this.canvas.clientHeight;
     ctx.clearRect(0, 0, w, h);
 
-    const schematic = !!this.state.schematic;
-
     // Scans (point-cloud underlay), drawn from a pre-rasterized offscreen
     // bitmap built once in setScans(). Place by mapping the bitmap's
     // world-frame bounds through the current pan/zoom.
-    if (!schematic && this._scanBitmap && this._scanBounds) {
+    if (this._scanBitmap && this._scanBounds) {
       const { minX, maxY, W, H, ppm } = this._scanBounds;
       const [sx0, sy0] = this.w2s(minX, maxY);  // bitmap's top-left in world
       const dw = (W / ppm) * this.scale;
@@ -257,51 +266,49 @@ export class Map2D {
       this._labelPoly(z.polygon_seed, z.name, '#fc8181');
     }
 
-    if (!schematic) {
-      // Edges
-      ctx.strokeStyle = 'rgba(160, 174, 192, 0.45)';
-      ctx.lineWidth = 1;
-      const wpById = Object.fromEntries(this.graph.waypoints.map(w => [w.id, w]));
+    // Edges
+    ctx.strokeStyle = 'rgba(160, 174, 192, 0.45)';
+    ctx.lineWidth = 1;
+    const wpById = Object.fromEntries(this.graph.waypoints.map(w => [w.id, w]));
+    ctx.beginPath();
+    for (const e of this.graph.edges) {
+      const a = wpById[e.from], b = wpById[e.to];
+      if (!a || !b) continue;
+      const [ax, ay] = this.w2s(a.x, a.y);
+      const [bx, by] = this.w2s(b.x, b.y);
+      ctx.moveTo(ax, ay); ctx.lineTo(bx, by);
+    }
+    ctx.stroke();
+
+    // Waypoints
+    for (const wp of this.graph.waypoints) {
+      const [x, y] = this.w2s(wp.x, wp.y);
+      const poi = this.state.annotations.waypoint_pois[wp.id];
+      const tagged = poi && (poi.name || poi.tags?.length);
+      ctx.fillStyle = (this.state.selectedWaypointId === wp.id) ? '#f6ad55'
+        : tagged ? '#63b3ed' : '#a0aec0';
       ctx.beginPath();
-      for (const e of this.graph.edges) {
-        const a = wpById[e.from], b = wpById[e.to];
-        if (!a || !b) continue;
-        const [ax, ay] = this.w2s(a.x, a.y);
-        const [bx, by] = this.w2s(b.x, b.y);
-        ctx.moveTo(ax, ay); ctx.lineTo(bx, by);
-      }
-      ctx.stroke();
+      ctx.arc(x, y, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
 
-      // Waypoints
-      for (const wp of this.graph.waypoints) {
-        const [x, y] = this.w2s(wp.x, wp.y);
-        const poi = this.state.annotations.waypoint_pois[wp.id];
-        const tagged = poi && (poi.name || poi.tags?.length);
-        ctx.fillStyle = (this.state.selectedWaypointId === wp.id) ? '#f6ad55'
-          : tagged ? '#63b3ed' : '#a0aec0';
-        ctx.beginPath();
-        ctx.arc(x, y, 5, 0, Math.PI * 2);
-        ctx.fill();
+    // Fiducials, colored by category. Doors (those in annotations.doors) get
+    // an outlined ring on top of the localization color.
+    ctx.font = '11px ui-monospace, monospace';
+    const doorTagIds = new Set((this.state.annotations.doors || []).map(d => d.tag_id));
+    for (const f of this.graph.fiducials) {
+      const [x, y] = this.w2s(f.x, f.y);
+      ctx.fillStyle = FIDUCIAL_COLORS[f.category] || FIDUCIAL_COLORS.unknown;
+      ctx.fillRect(x - 6, y - 6, 12, 12);
+      if (doorTagIds.has(f.tag_id)) {
+        ctx.strokeStyle = '#f6e05e';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x - 9, y - 9, 18, 18);
       }
-
-      // Fiducials, colored by category. Doors (those in annotations.doors) get
-      // an outlined ring on top of the localization color.
-      ctx.font = '11px ui-monospace, monospace';
-      const doorTagIds = new Set((this.state.annotations.doors || []).map(d => d.tag_id));
-      for (const f of this.graph.fiducials) {
-        const [x, y] = this.w2s(f.x, f.y);
-        ctx.fillStyle = FIDUCIAL_COLORS[f.category] || FIDUCIAL_COLORS.unknown;
-        ctx.fillRect(x - 6, y - 6, 12, 12);
-        if (doorTagIds.has(f.tag_id)) {
-          ctx.strokeStyle = '#f6e05e';
-          ctx.lineWidth = 2;
-          ctx.strokeRect(x - 9, y - 9, 18, 18);
-        }
-        ctx.fillStyle = '#fff';
-        const tag = `#${f.tag_id}`;
-        const cat = doorTagIds.has(f.tag_id) ? 'door' : (f.category || 'unknown');
-        ctx.fillText(`${tag} ${cat}`, x + 11, y - 4);
-      }
+      ctx.fillStyle = '#fff';
+      const tag = `#${f.tag_id}`;
+      const cat = doorTagIds.has(f.tag_id) ? 'door' : (f.category || 'unknown');
+      ctx.fillText(`${tag} ${cat}`, x + 11, y - 4);
     }
 
     // Patrol: dashed line in stop order (straight segments; GraphNav still
@@ -406,6 +413,30 @@ export class Map2D {
       ctx.restore();
     }
 
+    // Go mode: shade where a click is accepted (one path, so overlaps stay even).
+    const goActive = !!this.cb.goMode?.();
+    this.canvas.style.cursor = goActive ? 'crosshair' : '';
+    const limit = this.state.live?.maxGoalDistance;
+    if (goActive && limit) {
+      const r = limit * this.scale;
+      ctx.fillStyle = 'rgba(72, 187, 120, 0.08)';
+      ctx.beginPath();
+      for (const wp of this.graph.waypoints) {
+        const [x, y] = this.w2s(wp.x, wp.y);
+        ctx.moveTo(x + r, y);
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+      }
+      ctx.fill();
+    }
+    // The point being picked, and the goal Spot is walking to.
+    if (this.goDrag) {
+      this._drawGoal(this.goDrag.wx, this.goDrag.wy, this._goHeadingDeg());
+    }
+    const ns = this.state.live?.enabled ? this.state.live.navStatus : null;
+    if (ns?.goal && ns.state === 'navigating') {
+      this._drawGoal(ns.goal.x, ns.goal.y, ns.heading_deg);
+    }
+
     // Live robot pose (drawn on top of everything else).
     const pose = this.state.live?.pose;
     if (this.state.live?.enabled && pose) {
@@ -428,21 +459,35 @@ export class Map2D {
       ctx.stroke();
       ctx.restore();
     }
-
-    // In-progress polygon
-    if (this.polygonMode) {
-      ctx.strokeStyle = this.polygonMode.type === 'room' ? '#48bb78' : '#fc8181';
-      ctx.fillStyle = this.polygonMode.type === 'room'
-        ? 'rgba(72,187,120,0.1)' : 'rgba(252,129,129,0.1)';
-      ctx.setLineDash([5, 4]);
-      this._fillPoly(this.polygonMode.vertices, true);
-      ctx.setLineDash([]);
-      ctx.fillStyle = '#fff';
-      ctx.fillText(`drawing ${this.polygonMode.type} (double-click to finish)`, 12, 22);
-    }
   }
 
-  _fillPoly(pts, openOk = false) {
+  _drawGoal(x, y, headingDeg) {
+    const ctx = this.ctx;
+    const [sx, sy] = this.w2s(x, y);
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.strokeStyle = ctx.fillStyle = '#48bb78';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.arc(0, 0, 9, 0, Math.PI * 2);
+    ctx.stroke();
+    if (headingDeg != null) {
+      ctx.rotate(-headingDeg * Math.PI / 180);
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(26, 0);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(34, 0);
+      ctx.lineTo(24, 5);
+      ctx.lineTo(24, -5);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  _fillPoly(pts) {
     if (pts.length < 2) return;
     const ctx = this.ctx;
     ctx.beginPath();
@@ -450,7 +495,7 @@ export class Map2D {
       const [sx, sy] = this.w2s(x, y);
       if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
     });
-    if (!openOk || pts.length >= 3) ctx.closePath();
+    ctx.closePath();
     ctx.fill();
     ctx.stroke();
   }

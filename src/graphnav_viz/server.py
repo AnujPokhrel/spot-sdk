@@ -18,8 +18,13 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
 
 from . import export, loader
+from .camera_combine import FRONT_COMBINED, FRONT_LEFT, FRONT_RIGHT, FrontCombiner
 from .config import AppConfig, load_config
 from .schema import Annotations, Patrol
+
+
+class LeaseHeldElsewhere(Exception):
+    """Another client holds the body lease and it wasn't taken from them on purpose."""
 
 
 class RobotSession:
@@ -62,6 +67,8 @@ class RobotSession:
         # a keepalive in a background thread until the process exits.
         self.lease_client.take()
         self._lease_keepalive = LeaseKeepAlive(self.lease_client, return_at_exit=True)
+        # How Spot names us in lease listings, known for sure right after taking it.
+        self.client_name = self.lease_holder()[0]
         self.uploaded_graph: str | None = None
         self._lock = threading.Lock()
         # Background navigation thread state. navigate_to commands time out
@@ -74,6 +81,37 @@ class RobotSession:
         # levels the body again, and resets this to 0.
         self.tilt_deg = 0.0
 
+    def lease_holder(self) -> tuple[str, bool]:
+        """(client name, gone stale) of the body lease's holder, as Spot reports it.
+        A holder stays listed after it stops checking in, hence the stale flag."""
+        for resource in self.lease_client.list_leases(timeout=NAV_RPC_TIMEOUT_S):
+            if resource.resource == 'body':
+                return resource.lease_owner.client_name, resource.is_stale
+        return '', True
+
+    def ensure_lease(self) -> None:
+        """Take the body lease back if we lost it by accident, but not from someone else.
+
+        Spot can drop our lease when keepalives arrive late on a congested link, and
+        the keepalive never recovers on its own, so every later command would fail
+        with LeaseNotOwnedByWallet. If another live client took it (say the tablet, to
+        stop the robot), it stays theirs until the operator presses Hijack lease.
+        This is a local wallet check; it only talks to the robot when the lease is
+        actually lost.
+        """
+        from bosdyn.client.lease import LeaseState, NoSuchLease
+        try:
+            status = self.robot.lease_wallet.get_lease_state().lease_status
+        except NoSuchLease:
+            status = None
+        if status == LeaseState.Status.SELF_OWNER:
+            return
+        holder, stale = self.lease_holder()
+        if holder and holder != self.client_name and not stale:
+            raise LeaseHeldElsewhere(f'{holder} holds the lease. Press "Hijack lease" to take it.')
+        LOG.warning('Body lease lost (%s); taking it back', status)
+        self.lease_client.take()
+
     def shutdown(self) -> None:
         """Release the estop endpoint cleanly so the tablet can resume."""
         try:
@@ -83,7 +121,20 @@ class RobotSession:
 
 LOG = logging.getLogger(__name__)
 
+SOFTWARE_ESTOP = 'software_estop'
+
 STATIC_DIR = Path(__file__).parent / 'static'
+
+
+class GZipExceptCameraStreams(GZipMiddleware):
+    """GZip for everything but the MJPEG streams. JPEGs barely compress, and gzip holds
+    output back until it has enough to send, which shows up as a laggy or blank video."""
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] == 'http' and scope['path'].startswith('/api/camera_stream/'):
+            await self.app(scope, receive, send)
+        else:
+            await super().__call__(scope, receive, send)
 
 
 class UIStaticFiles(StaticFiles):
@@ -105,21 +156,50 @@ class UIStaticFiles(StaticFiles):
 # goals always carry an explicit one. Tune on the robot if it hunts.
 HEADING_TOLERANCE_DEG = 5.0
 
+# A navigation RPC gives up after NAV_RPC_TIMEOUT_S instead of the SDK's default 30 s,
+# and the route only fails after NAV_RPC_RETRY_S without a good reply. The commands last
+# 1 s, so Spot halts by itself during an outage and resumes when the link returns.
+NAV_RPC_TIMEOUT_S = 3.0
+NAV_RPC_RETRY_S = 15.0
+
+# How far a "go to this point" goal may be from the nearest waypoint. GraphNav walks the
+# graph to a waypoint near the goal, then goes straight to it avoiding obstacles, so this
+# also bounds that off-graph walk.
+MAX_GOAL_DISTANCE_M = 5.0
+# Waypoints farther than this above or below the robot are on another floor: a goal
+# stays on Spot's current floor.
+GOAL_FLOOR_TOLERANCE_M = 1.0
+
+# One press of a Move button: body-frame (forward m/s, left m/s, counter-clockwise rad/s),
+# for MOVE_DURATION_S. Spot stops by itself when the command ends, so nothing has to
+# arrive to stop it, and nothing needs a map or localization.
+MOVE_DURATION_S = 0.5
+MOVE_VELOCITIES = {
+    'forward': (0.5, 0.0, 0.0),
+    'backward': (-0.5, 0.0, 0.0),
+    'left': (0.0, 0.4, 0.0),
+    'right': (0.0, -0.4, 0.0),
+    'turn_left': (0.0, 0.0, 0.6),
+    'turn_right': (0.0, 0.0, -0.6),
+}
+
 # Body pitch range for "look up/down". Spot clamps body orientation to what it
 # can hold anyway; this keeps the UI's steps within a sane range.
 MAX_TILT_DEG = 30.0
 
 
 def make_status(state: str, destination: str | None = None, heading_deg: float | None = None,
-                *, sweep: dict | None = None, patrol: dict | None = None, **extra) -> dict:
+                *, sweep: dict | None = None, patrol: dict | None = None,
+                goal: dict | None = None, **extra) -> dict:
     """Build a nav_status dict. Every status has the same keys:
 
     heading_deg is the commanded map-frame heading (None = the waypoint's
     recorded orientation). sweep / patrol carry progress for those modes and
-    are None otherwise. `extra` is for `error`.
+    are None otherwise. goal is {x, y, z, near} for a "go to this point" command,
+    which has no destination waypoint. `extra` is for `error`.
     """
     return {'state': state, 'destination': destination, 'heading_deg': heading_deg,
-            'sweep': sweep, 'patrol': patrol, **extra}
+            'sweep': sweep, 'patrol': patrol, 'goal': goal, **extra}
 
 
 def quat_yaw(q) -> float:
@@ -206,7 +286,7 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
         return graphs[name], cache[name]
 
     app = FastAPI(title='GraphNav Annotation App')
-    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    app.add_middleware(GZipExceptCameraStreams, minimum_size=1024)
 
     @app.get('/api/graphs')
     def list_graphs():
@@ -282,6 +362,7 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
             'enabled': session is not None,
             'hostname': session.hostname if session else None,
             'uploaded_graph': session.uploaded_graph if session else None,
+            'max_goal_distance_m': MAX_GOAL_DISTANCE_M,
         }
 
     def _require_session() -> RobotSession:
@@ -343,16 +424,17 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
                 raise HTTPException(502, f'set_localization failed: {e}') from e
         return {'ok': True, 'waypoint_id': resp.waypoint_id}
 
-    def _drive_until_done(s: RobotSession, cancel: threading.Event, wp: dict,
-                          heading_deg: float | None) -> str:
-        """Re-issue navigate_to until the robot arrives, fails, or `cancel` is set.
+    def _follow_route(s: RobotSession, cancel: threading.Event, issue) -> str:
+        """Re-issue a navigation command until the robot arrives, fails, or `cancel`
+        is set. `issue(cmd_id)` sends the command and returns its id.
 
-        With `heading_deg`, the goal is the waypoint itself rotated to that
-        map-frame heading, so a robot already on the waypoint just turns in
-        place. Returns 'reached', 'canceled', or a failure label; RPC errors
+        Returns 'reached', 'canceled', or a failure label. Temporary RPC errors
+        are retried for NAV_RPC_RETRY_S; other errors, and ones that outlast that,
         propagate to the caller.
         """
         from bosdyn.api.graph_nav import graph_nav_pb2
+        from bosdyn.client.exceptions import RetryableRpcError
+        from bosdyn.client.graph_nav import NoPathError
         FAIL_STATES = {
             graph_nav_pb2.NavigationFeedbackResponse.STATUS_LOST: 'lost',
             graph_nav_pb2.NavigationFeedbackResponse.STATUS_STUCK: 'stuck',
@@ -360,24 +442,78 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
             graph_nav_pb2.NavigationFeedbackResponse.STATUS_NO_LOCALIZATION: 'no_localization',
             graph_nav_pb2.NavigationFeedbackResponse.STATUS_COMMAND_OVERRIDDEN: 'overridden',
         }
-        body_goal = travel_params = None
-        if heading_deg is not None:
-            body_goal = heading_goal_in_waypoint(wp, heading_deg)
-            travel_params = graph_nav_pb2.TravelParams(
-                max_yaw=math.radians(HEADING_TOLERANCE_DEG))
         cmd_id = None
+        last_ok = time.monotonic()
         while not cancel.is_set():
-            cmd_id = s.graph_nav.navigate_to(
-                wp['id'], 1.0, travel_params=travel_params, command_id=cmd_id,
-                destination_waypoint_tform_body_goal=body_goal)
-            if cancel.wait(0.5):
-                break
-            fb = s.graph_nav.navigation_feedback(cmd_id).status
+            try:
+                s.ensure_lease()
+                cmd_id = issue(cmd_id)
+                if cancel.wait(0.5):
+                    break
+                fb = s.graph_nav.navigation_feedback(cmd_id, timeout=NAV_RPC_TIMEOUT_S).status
+            except NoPathError:
+                return 'no_route'
+            except RetryableRpcError as e:
+                if time.monotonic() - last_ok > NAV_RPC_RETRY_S:
+                    raise
+                LOG.warning('Navigation RPC failed (%s); retrying', type(e).__name__)
+                cmd_id = None  # the old command may have expired, so start a fresh one
+                cancel.wait(0.2)
+                continue
+            last_ok = time.monotonic()
             if fb == graph_nav_pb2.NavigationFeedbackResponse.STATUS_REACHED_GOAL:
                 return 'reached'
             if fb in FAIL_STATES:
                 return FAIL_STATES[fb]
         return 'canceled'
+
+    def _drive_until_done(s: RobotSession, cancel: threading.Event, wp: dict,
+                          heading_deg: float | None) -> str:
+        """Drive to waypoint `wp`. See _follow_route for the result.
+
+        With `heading_deg`, the goal is the waypoint itself rotated to that
+        map-frame heading, so a robot already on the waypoint just turns in
+        place.
+        """
+        from bosdyn.api.graph_nav import graph_nav_pb2
+        body_goal = travel_params = None
+        if heading_deg is not None:
+            body_goal = heading_goal_in_waypoint(wp, heading_deg)
+            travel_params = graph_nav_pb2.TravelParams(
+                max_yaw=math.radians(HEADING_TOLERANCE_DEG))
+
+        def issue(cmd_id):
+            return s.graph_nav.navigate_to(
+                wp['id'], 1.0, travel_params=travel_params, command_id=cmd_id,
+                destination_waypoint_tform_body_goal=body_goal, timeout=NAV_RPC_TIMEOUT_S)
+        return _follow_route(s, cancel, issue)
+
+    def _drive_to_point(s: RobotSession, cancel: threading.Event, goal: dict,
+                        heading_deg: float | None) -> str:
+        """Drive to a map-frame point. See _follow_route for the result.
+
+        Without `heading_deg` only the position has to be reached, so Spot keeps
+        whatever heading it arrives with.
+        """
+        from bosdyn.api import geometry_pb2
+        from bosdyn.api.graph_nav import graph_nav_pb2
+        from bosdyn.client.math_helpers import Quat, SE3Pose
+        if heading_deg is None:
+            yaw = 0.0
+            travel_params = graph_nav_pb2.TravelParams(ignore_final_yaw=True)
+        else:
+            yaw = math.radians(heading_deg)
+            travel_params = graph_nav_pb2.TravelParams(
+                max_yaw=math.radians(HEADING_TOLERANCE_DEG))
+        seed_tform_goal = SE3Pose(goal['x'], goal['y'], goal['z'], Quat.from_yaw(yaw)).to_proto()
+        tolerance = geometry_pb2.Vec3(x=MAX_GOAL_DISTANCE_M, y=MAX_GOAL_DISTANCE_M,
+                                      z=GOAL_FLOOR_TOLERANCE_M)
+
+        def issue(cmd_id):
+            return s.graph_nav.navigate_to_anchor(
+                seed_tform_goal, 1.0, travel_params=travel_params, command_id=cmd_id,
+                goal_waypoint_rt_seed_ewrt_seed_tolerance=tolerance, timeout=NAV_RPC_TIMEOUT_S)
+        return _follow_route(s, cancel, issue)
 
     def _publish(s: RobotSession, status: dict) -> None:
         # A worker that was replaced by a newer command must not overwrite
@@ -393,6 +529,16 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
         except Exception as e:  # noqa: BLE001
             LOG.exception('navigate_to failed mid-route')
             _publish(s, make_status('error', wp['id'], heading_deg,
+                                    error=f'{type(e).__name__}: {e}'))
+
+    def _run_point_worker(s: RobotSession, cancel: threading.Event, goal: dict,
+                          heading_deg: float | None) -> None:
+        try:
+            _publish(s, make_status(_drive_to_point(s, cancel, goal, heading_deg),
+                                    None, heading_deg, goal=goal))
+        except Exception as e:  # noqa: BLE001
+            LOG.exception('navigate_to_anchor failed mid-route')
+            _publish(s, make_status('error', None, heading_deg, goal=goal,
                                     error=f'{type(e).__name__}: {e}'))
 
     def _sweep_status(wp: dict, headings: list[float], dwell_s: float,
@@ -476,7 +622,7 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
 
         s.nav_status = initial_status
         s.tilt_deg = 0.0   # GraphNav levels the body when it takes over
-        t = threading.Thread(target=run, name=f'nav-{initial_status["destination"][:8]}',
+        t = threading.Thread(target=run, name=f'nav-{(initial_status["destination"] or "point")[:8]}',
                              daemon=True)
         s._nav_thread = t
         t.start()
@@ -494,10 +640,14 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
         return wp
 
     def _require_can_move(s: RobotSession) -> None:
+        try:
+            s.ensure_lease()
+        except LeaseHeldElsewhere as e:
+            raise HTTPException(409, str(e)) from e
         if s.robot.is_estopped():
             raise HTTPException(409, 'Robot is e-stopped. Release the e-stop first.')
         if not s.robot.is_powered_on():
-            raise HTTPException(409, 'Robot motors are off. Click "Power on" in the Drive tab first.')
+            raise HTTPException(409, 'Robot motors are off. Click "Power on" first.')
 
     def _nav_target(s: RobotSession, name: str, waypoint_id: str) -> dict:
         """Resolve a waypoint for a motion command and check the robot can move."""
@@ -519,6 +669,40 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
         _start_worker(s, make_status('navigating', wp['id'], heading_deg),
                       _run_nav_worker, wp, heading_deg)
         return {'ok': True, 'destination': wp['id'], 'heading_deg': heading_deg}
+
+    @app.post('/api/graphs/{name}/navigate_point')
+    def post_navigate_point(name: str, x: float, y: float, heading_deg: float | None = None):
+        """Drive to any map-frame point within MAX_GOAL_DISTANCE_M of a waypoint on
+        Spot's floor. With `heading_deg` (same convention as navigate), finish facing
+        that heading; without it, only the position has to be reached."""
+        s = _require_session()
+        if not (math.isfinite(x) and math.isfinite(y)):
+            raise HTTPException(422, 'x and y must be finite numbers.')
+        if heading_deg is not None:
+            if not math.isfinite(heading_deg):
+                raise HTTPException(422, 'heading_deg must be a finite number.')
+            heading_deg %= 360.0
+        gd = _require_uploaded(s, name)
+        _require_can_move(s)
+        try:
+            loc = s.graph_nav.get_localization_state().localization
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f'get_localization_state failed: {e}') from e
+        if not loc.waypoint_id:
+            raise HTTPException(409, 'Spot is not localized. Localize first.')
+        z = loc.seed_tform_body.position.z
+        floor = [w for w in gd.waypoints if abs(w['z'] - z) <= GOAL_FLOOR_TOLERANCE_M]
+        if not floor:
+            raise HTTPException(409, "No waypoints on Spot's current floor.")
+        near = min(floor, key=lambda w: math.hypot(w['x'] - x, w['y'] - y))
+        distance = math.hypot(near['x'] - x, near['y'] - y)
+        if distance > MAX_GOAL_DISTANCE_M:
+            raise HTTPException(409, f'{distance:.1f} m from the nearest waypoint ({near["name"]}), '
+                                     f'limit {MAX_GOAL_DISTANCE_M:g} m')
+        goal = {'x': x, 'y': y, 'z': z, 'near': near['name']}
+        _start_worker(s, make_status('navigating', None, heading_deg, goal=goal),
+                      _run_point_worker, goal, heading_deg)
+        return {'ok': True, 'goal': goal, 'heading_deg': heading_deg}
 
     @app.post('/api/graphs/{name}/sweep/{waypoint_id}')
     def post_sweep(name: str, waypoint_id: str, step_deg: float = 30.0, dwell_s: float = 3.0):
@@ -590,6 +774,7 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
         s = _require_session()
         with s._lock:
             try:
+                s.ensure_lease()
                 s.robot.power_on(timeout_sec=20)
             except Exception as e:  # noqa: BLE001
                 LOG.exception('power_on failed')
@@ -602,6 +787,7 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
         from bosdyn.client.robot_command import blocking_stand
         with s._lock:
             try:
+                s.ensure_lease()
                 blocking_stand(s.command_client, timeout_sec=10)
             except Exception as e:  # noqa: BLE001
                 LOG.exception('stand failed')
@@ -618,6 +804,7 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
         s._nav_cancel.set()
         with s._lock:
             try:
+                s.ensure_lease()
                 blocking_sit(s.command_client, timeout_sec=10)
             except Exception as e:  # noqa: BLE001
                 LOG.exception('sit failed')
@@ -651,6 +838,48 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
         s.tilt_deg = pitch_deg
         return {'ok': True, 'tilt_deg': pitch_deg}
 
+    @app.post('/api/move/{direction}')
+    def post_move(direction: str):
+        """Walk for MOVE_DURATION_S, then stop. No map or localization needed."""
+        s = _require_session()
+        if direction not in MOVE_VELOCITIES:
+            raise HTTPException(404, f'unknown direction {direction!r}')
+        if s._nav_thread and s._nav_thread.is_alive():
+            # GraphNav would override this on its next re-issue.
+            raise HTTPException(409, 'Spot is navigating. Wait until it arrives, or press STOP first.')
+        _require_can_move(s)
+        from bosdyn.client.robot_command import RobotCommandBuilder
+        v_x, v_y, v_rot = MOVE_VELOCITIES[direction]
+        cmd = RobotCommandBuilder.synchro_velocity_command(v_x, v_y, v_rot)
+        with s._lock:
+            try:
+                s.command_client.robot_command(cmd, end_time_secs=time.time() + MOVE_DURATION_S,
+                                               timeout=NAV_RPC_TIMEOUT_S)
+            except Exception as e:  # noqa: BLE001
+                LOG.exception('move failed')
+                raise HTTPException(502, f'move failed: {type(e).__name__}: {e}') from e
+        s.tilt_deg = 0.0   # a walking command levels the body
+        return {'ok': True, 'direction': direction, 'duration_s': MOVE_DURATION_S}
+
+    @app.get('/api/lease')
+    def get_lease():
+        s = _require_session()
+        try:
+            holder, stale = s.lease_holder()
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f'list_leases failed: {e}') from e
+        return {'ours': holder == s.client_name, 'holder': holder, 'stale': stale}
+
+    @app.post('/api/lease/hijack')
+    def post_lease_hijack():
+        """Forcibly take the body lease from whoever holds it (the tablet, say)."""
+        s = _require_session()
+        try:
+            s.lease_client.take()
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f'take lease failed: {e}') from e
+        return {'ok': True}
+
     @app.get('/api/cameras')
     def get_cameras():
         s = _require_session()
@@ -663,11 +892,15 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
             sources = s.image_client.list_image_sources()
         except Exception as e:  # noqa: BLE001
             raise HTTPException(502, f'list_image_sources failed: {e}') from e
-        return [
+        listed = [
             {'name': src.name, 'image_type': type_names.get(src.image_type, 'unknown'),
              'cols': src.cols, 'rows': src.rows}
             for src in sources
         ]
+        names = {src['name'] for src in listed}
+        if FRONT_LEFT in names and FRONT_RIGHT in names:
+            listed.insert(0, {'name': FRONT_COMBINED, 'image_type': 'visual'})
+        return listed
 
     @app.get('/api/camera/{source}')
     def get_camera_frame(source: str):
@@ -688,27 +921,42 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
     def get_camera_stream(source: str, fps: float = 8.0):
         """MJPEG stream (multipart/x-mixed-replace) — consumable directly by an <img> tag.
 
-        Pulls a fresh JPEG from the robot's image service on every frame; there's
-        no server-side buffering, so the stream stops as soon as the client
-        disconnects (browser navigates away / tab closes / img.src cleared).
+        Pulls a fresh JPEG from the robot's image service on every frame and passes
+        it on undecoded; there's no server-side buffering, so nothing is requested
+        from Spot once the client disconnects (browser navigates away / tab closes /
+        img.src cleared). FRONT_COMBINED requests both front cameras and merges them,
+        which is also only done per frame of a connected stream.
         """
         s = _require_session()
         from bosdyn.api import image_pb2
+        from bosdyn.client.exceptions import RetryableRpcError
         from bosdyn.client.image import build_image_request
-        req = [build_image_request(source, quality_percent=75,
-                                    image_format=image_pb2.Image.FORMAT_JPEG)]
+        names = (FRONT_LEFT, FRONT_RIGHT) if source == FRONT_COMBINED else (source,)
+        req = [build_image_request(name, quality_percent=75, image_format=image_pb2.Image.FORMAT_JPEG)
+               for name in names]
         period = 1.0 / max(1.0, min(fps, 15.0))
 
         def frames():
+            combiner = None
             while True:
                 start = time.monotonic()
                 try:
-                    resp = s.image_client.get_image(req)
-                except Exception:  # noqa: BLE001 - client disconnect or robot hiccup; just stop
+                    resp = s.image_client.get_image(req, timeout=NAV_RPC_TIMEOUT_S)
+                except RetryableRpcError as e:   # a slow link; the stream carries on
+                    LOG.warning('camera_stream %r: %s', source, type(e).__name__)
+                    time.sleep(period)
+                    continue
+                except Exception:  # noqa: BLE001 - e.g. an unknown source; retrying won't help
                     LOG.exception('camera_stream %r: get_image failed, stopping stream', source)
                     return
-                if resp and resp[0].status == image_pb2.ImageResponse.STATUS_OK:
-                    jpg = resp[0].shot.image.data
+                if resp and all(r.status == image_pb2.ImageResponse.STATUS_OK for r in resp):
+                    if source == FRONT_COMBINED:
+                        by_name = {r.source.name: r for r in resp}
+                        left, right = by_name[FRONT_LEFT], by_name[FRONT_RIGHT]
+                        combiner = combiner or FrontCombiner(left, right)
+                        jpg = combiner.combine(left, right)
+                    else:
+                        jpg = resp[0].shot.image.data
                     yield (b'--frame\r\n'
                            b'Content-Type: image/jpeg\r\n'
                            b'Content-Length: ' + str(len(jpg)).encode() + b'\r\n\r\n'
@@ -726,15 +974,16 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
             rs = s.state_client.get_robot_state()
         except Exception as e:  # noqa: BLE001
             raise HTTPException(502, f'get_robot_state failed: {e}') from e
-        # Find our endpoint and report its level.
+        # Robot state reports every API endpoint under one 'software_estop'
+        # entry (not by endpoint name), next to hardware_estop/payload_estop.
         level_map = {
             robot_state_pb2.EStopState.STATE_NOT_ESTOPPED: 'allowed',
             robot_state_pb2.EStopState.STATE_ESTOPPED: 'cut',
             robot_state_pb2.EStopState.STATE_UNKNOWN: 'unknown',
         }
-        ours = next((e for e in rs.estop_states if e.name == s.estop_endpoint_name), None)
+        ours = next((e for e in rs.estop_states if e.name == SOFTWARE_ESTOP), None)
         any_other_estopped = any(
-            e.name != s.estop_endpoint_name and
+            e.name != SOFTWARE_ESTOP and
             e.state != robot_state_pb2.EStopState.STATE_NOT_ESTOPPED
             for e in rs.estop_states)
         if ours is None:
@@ -782,10 +1031,12 @@ def create_app(cfg: AppConfig, session: RobotSession | None = None) -> FastAPI:
         s._nav_cancel.set()
         with s._lock:
             try:
+                s.ensure_lease()
                 s.command_client.robot_command(RobotCommandBuilder.stop_command())
             except Exception as e:  # noqa: BLE001
                 raise HTTPException(502, f'stop failed: {e}') from e
-        s.nav_status = make_status('canceled', s.nav_status.get('destination'))
+        s.nav_status = make_status('canceled', s.nav_status.get('destination'),
+                                   goal=s.nav_status.get('goal'))
         return {'ok': True}
 
     app.mount('/', UIStaticFiles(directory=str(STATIC_DIR), html=True), name='static')
